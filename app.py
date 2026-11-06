@@ -21,7 +21,9 @@ from voice_clone import VoiceStore, synthesize_clone, stream_clone
 from turn_detector import TurnDetector, measure_speech
 from zhconv import convert as to_chinese_variant
 from fastapi.staticfiles import StaticFiles
-from api_config import normalize_key, fingerprint, auth_error
+from api_config import normalize_key, fingerprint
+from conversation import Conversation
+from llm_client import stream_chat
 from urllib.parse import urlsplit
 from windows_asyncio import disconnect_logging
 
@@ -344,7 +346,7 @@ async def websocket(ws: WebSocket):
         await ws.close(code=1008)
         return
     await ws.accept()
-    history = []
+    history = Conversation()
     task = None
     pcm = bytearray()
     recording = False
@@ -479,51 +481,34 @@ async def websocket(ws: WebSocket):
             # Bound all balanced-mode chunks, including the remainder after the lead.
             clone_full_reply = TTS_PROVIDER == "cosyvoice"
             content, pending = "", ""
-            async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=5)) as client:
-                async with client.stream("POST", DEEPSEEK_URL + "/chat/completions",
-                    headers={"Authorization": "Bearer " + API_KEY}, json={
-                    "model": LLM_MODEL, "messages": [{"role": "system", "content": SYSTEM}] + history[-12:] +
-                    [{"role": "user", "content": text}], "stream": True,
-                    "thinking": {"type": "disabled"}, "max_tokens": 512}) as response:
-                    if response.status_code != 200:
-                        raise RuntimeError(auth_error(response.status_code))
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        payload = line[5:].strip()
-                        if payload == "[DONE]":
-                            break
-                        chunk = json.loads(payload)
-                        if chunk.get("error"):
-                            raise RuntimeError("DeepSeek 返回错误，请检查账户及请求配置")
-                        choices = chunk.get("choices", [])
-                        token = (choices[0].get("delta", {}).get("content") or "") if choices else ""
-                        content += token
-                        pending += token
-                        if token:
-                            if first_token:
-                                mark("first_text")
-                                first_token = False
-                            await send("token", rid, text=token)
-                        if clone_full_reply and CLONE_PLAYBACK == "balanced":
-                            while True:
-                                segment, pending = split_lead(pending)
-                                if segment is None:
-                                    break
-                                await queue.put(segment)
-                        while not clone_full_reply:
-                            sentence, pending = split_sentence(pending)
-                            if sentence is None:
+            messages = [{"role": "system", "content": SYSTEM}] + history.messages() + [{"role": "user", "content": text}]
+            async with contextlib.aclosing(stream_chat(DEEPSEEK_URL, API_KEY, LLM_MODEL, messages)) as events:
+                async for event in events:
+                    token = event.text
+                    content += token
+                    pending += token
+                    if first_token:
+                        mark("first_text")
+                        first_token = False
+                    await send("token", rid, text=token)
+                    if clone_full_reply and CLONE_PLAYBACK == "balanced":
+                        while True:
+                            segment, pending = split_lead(pending)
+                            if segment is None:
                                 break
-                            await queue.put(sentence)
+                            await queue.put(segment)
+                    while not clone_full_reply:
+                        sentence, pending = split_sentence(pending)
+                        if sentence is None:
+                            break
+                        await queue.put(sentence)
             mark("llm_done")
             if pending.strip():
                 await queue.put(pending)
             await queue.put(None)
             await worker
             mark("all_audio_sent")
-            history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": content}])
-            del history[:-12]
+            history.add_turn([{"role": "user", "content": text}, {"role": "assistant", "content": content}])
             await send("done", rid, tts_failed=tts_failed)
         except asyncio.CancelledError:
             raise
