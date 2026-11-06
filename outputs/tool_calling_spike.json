@@ -1,0 +1,308 @@
+{
+  "measured_at": "2026-11-06T02:07:07-0500",
+  "model": "deepseek-flash",
+  "models_offered": [
+    "deepseek-flash",
+    "deepseek-v4-pro"
+  ],
+  "model_listed": true,
+  "tool_cases": [
+    {
+      "label": "天气",
+      "prompt": "北京明天会下雨吗？",
+      "passed": true,
+      "content": "",
+      "calls": [
+        {
+          "id": "call_00_Ca3Stsd1KW9QjvoqdExh4589",
+          "name": "get_weather",
+          "arguments": "{\"city\": \"北京\", \"date\": \"明天\"}"
+        }
+      ],
+      "finish_reason": "tool_calls",
+      "usage": {
+        "prompt_tokens": 793,
+        "completion_tokens": 54,
+        "total_tokens": 847,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 793
+      },
+      "first_text": null,
+      "first_tool": 0.8918180000036955,
+      "total": 1.0121806000024662,
+      "text_before_tool": false,
+      "arg_chunks": 13,
+      "error": null
+    },
+    {
+      "label": "时间",
+      "prompt": "现在几点了？",
+      "passed": false,
+      "content": "现在是凌晨2点06分，周五。",
+      "calls": [],
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 791,
+        "completion_tokens": 9,
+        "total_tokens": 800,
+        "prompt_tokens_details": {
+          "cached_tokens": 640
+        },
+        "prompt_cache_hit_tokens": 640,
+        "prompt_cache_miss_tokens": 151
+      },
+      "first_text": 0.6081018000040785,
+      "first_tool": null,
+      "total": 0.7186967000016011,
+      "text_before_tool": false,
+      "arg_chunks": 0,
+      "error": null
+    },
+    {
+      "label": "记忆",
+      "prompt": "记住我不吃香菜。",
+      "passed": true,
+      "content": "好，记下了：你不吃香菜。",
+      "calls": [
+        {
+          "id": "call_00_bCP1Q8qIePSCqN59sFf39673",
+          "name": "remember",
+          "arguments": "{\"content\": \"用户不吃香菜\"}"
+        }
+      ],
+      "finish_reason": "tool_calls",
+      "usage": {
+        "prompt_tokens": 792,
+        "completion_tokens": 46,
+        "total_tokens": 838,
+        "prompt_tokens_details": {
+          "cached_tokens": 640
+        },
+        "prompt_cache_hit_tokens": 640,
+        "prompt_cache_miss_tokens": 152
+      },
+      "first_text": 0.9888757999942754,
+      "first_tool": 1.132796399993822,
+      "total": 1.2087814999977127,
+      "text_before_tool": true,
+      "arg_chunks": 9,
+      "error": null
+    },
+    {
+      "label": "提醒",
+      "prompt": "明天下午三点提醒我开会。",
+      "passed": true,
+      "content": "",
+      "calls": [
+        {
+          "id": "call_00_S1U9nXf1plppzDwZSLwa9272",
+          "name": "set_reminder",
+          "arguments": "{\"content\": \"开会\", \"due_at\": \"2026-11-07T15:00:00\"}"
+        }
+      ],
+      "finish_reason": "tool_calls",
+      "usage": {
+        "prompt_tokens": 794,
+        "completion_tokens": 67,
+        "total_tokens": 861,
+        "prompt_tokens_details": {
+          "cached_tokens": 640
+        },
+        "prompt_cache_hit_tokens": 640,
+        "prompt_cache_miss_tokens": 154
+      },
+      "first_text": null,
+      "first_tool": 1.361944999996922,
+      "total": 1.4216529999976046,
+      "text_before_tool": false,
+      "arg_chunks": 25,
+      "error": null
+    },
+    {
+      "label": "多城市",
+      "prompt": "北京和上海今天哪个更热？",
+      "passed": true,
+      "content": "",
+      "calls": [
+        {
+          "id": "call_00_937KuCa8ibut6RcYEbI07568",
+          "name": "get_weather",
+          "arguments": "{\"city\": \"北京\", \"date\": \"今天\"}"
+        },
+        {
+          "id": "call_01_zulPQaiVf6d97UpDcKcB5456",
+          "name": "get_weather",
+          "arguments": "{\"city\": \"上海\", \"date\": \"今天\"}"
+        }
+      ],
+      "finish_reason": "tool_calls",
+      "usage": {
+        "prompt_tokens": 795,
+        "completion_tokens": 99,
+        "total_tokens": 894,
+        "prompt_tokens_details": {
+          "cached_tokens": 640
+        },
+        "prompt_cache_hit_tokens": 640,
+        "prompt_cache_miss_tokens": 155
+      },
+      "first_text": null,
+      "first_tool": 0.9324746999991476,
+      "total": 1.16150750000088,
+      "text_before_tool": false,
+      "arg_chunks": 26,
+      "error": null
+    }
+  ],
+  "chat_cases": [
+    {
+      "prompt": "你好呀",
+      "passed": true,
+      "content": "你好，有什么想聊的？",
+      "calls": [],
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 789,
+        "completion_tokens": 7,
+        "total_tokens": 796,
+        "prompt_tokens_details": {
+          "cached_tokens": 640
+        },
+        "prompt_cache_hit_tokens": 640,
+        "prompt_cache_miss_tokens": 149
+      },
+      "first_text": 0.6478889999998501,
+      "first_tool": null,
+      "total": 0.7323579999938374,
+      "text_before_tool": false,
+      "arg_chunks": 0,
+      "error": null
+    },
+    {
+      "prompt": "讲个很短的笑话",
+      "passed": true,
+      "content": "鱼为什么不上岸？怕被人钓鱼执法。",
+      "calls": [],
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 792,
+        "completion_tokens": 10,
+        "total_tokens": 802,
+        "prompt_tokens_details": {
+          "cached_tokens": 640
+        },
+        "prompt_cache_hit_tokens": 640,
+        "prompt_cache_miss_tokens": 152
+      },
+      "first_text": 0.7349705000015092,
+      "first_tool": null,
+      "total": 0.9107908000005409,
+      "text_before_tool": false,
+      "arg_chunks": 0,
+      "error": null
+    },
+    {
+      "prompt": "你觉得猫可爱吗？",
+      "passed": true,
+      "content": "猫确实挺可爱的。软乎乎的毛发、小肉垫，还有那种高冷又爱撒娇的反差，看着就让人心情变好。不过猫的性格差异很大，有的黏人，有的独立，得看缘分。",
+      "calls": [],
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 792,
+        "completion_tokens": 47,
+        "total_tokens": 839,
+        "prompt_tokens_details": {
+          "cached_tokens": 640
+        },
+        "prompt_cache_hit_tokens": 640,
+        "prompt_cache_miss_tokens": 152
+      },
+      "first_text": 0.8126387000011164,
+      "first_tool": null,
+      "total": 1.2715234999996028,
+      "text_before_tool": false,
+      "arg_chunks": 0,
+      "error": null
+    },
+    {
+      "prompt": "用一句话解释什么是递归",
+      "passed": true,
+      "content": "递归就是函数自己调用自己，把大问题拆成同样形式的小问题，直到碰到能直接解决的基础情况。",
+      "calls": [],
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 792,
+        "completion_tokens": 25,
+        "total_tokens": 817,
+        "prompt_tokens_details": {
+          "cached_tokens": 640
+        },
+        "prompt_cache_hit_tokens": 640,
+        "prompt_cache_miss_tokens": 152
+      },
+      "first_text": 0.571282600001723,
+      "first_tool": null,
+      "total": 0.8622508000044036,
+      "text_before_tool": false,
+      "arg_chunks": 0,
+      "error": null
+    }
+  ],
+  "follow_up": {
+    "passed": true,
+    "content": "北京明天有中雨，气温11到18度，出门记得带伞加件外套。",
+    "calls": [],
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 879,
+      "completion_tokens": 20,
+      "total_tokens": 899,
+      "prompt_tokens_details": {
+        "cached_tokens": 640
+      },
+      "prompt_cache_hit_tokens": 640,
+      "prompt_cache_miss_tokens": 239
+    },
+    "first_text": 0.8330187999963528,
+    "first_tool": null,
+    "total": 0.9998814999999013,
+    "text_before_tool": false,
+    "arg_chunks": 0,
+    "error": null
+  },
+  "latency": {
+    "without_tools": {
+      "samples": [
+        0.77,
+        1.203,
+        0.833,
+        1.059,
+        0.924,
+        0.725
+      ],
+      "median": 0.878,
+      "min": 0.725,
+      "max": 1.203
+    },
+    "with_tools": {
+      "samples": [
+        0.929,
+        0.84,
+        0.748,
+        0.639,
+        0.753,
+        0.936
+      ],
+      "median": 0.796,
+      "min": 0.639,
+      "max": 0.936
+    },
+    "extra_prompt_tokens": 684.0,
+    "failures": [],
+    "median_delta_seconds": -0.082
+  },
+  "passed": false
+}
