@@ -3,7 +3,9 @@ let ws, requestId = 0, recording = null, capturePending = false, replyBubble;
 let player, playAt = 0, audioChain = Promise.resolve();
 let listener = null, replyActive = false, master = null, spokenSegments = [], reportedPlaying = '', wasPlaying = false;
 const LISTEN_HINT = '待命中，直接说话即可', PLAYING_HINT = '播报中，直接说话可打断';
-const IGNORED = {noise:'没听清，已忽略', echo:'听到的是喇叭声，已忽略', short:'太短，已忽略'};
+const IGNORED = {noise:'没听清，已忽略', echo:'听到的是喇叭声，已忽略', short:'太短，已忽略', early:'请等问题播完再回答'};
+const CONFIRM_HINT = '请说“确认”或“取消”，也可以点按钮';
+let confirming = null;
 const playing = new Set();
 function status(text) { $('status').textContent = text; }
 function bubble(role, text = '') {
@@ -26,8 +28,22 @@ function stopPlayback() {
   playing.clear(); playAt = 0; audioChain = Promise.resolve(); spokenSegments = [];
   player?.resume(); duck(false);
 }
+function endConfirm() { confirming = null; $('confirmBox').hidden = true; }
+function askConfirm(rid, text) {
+  confirming = rid; $('confirmText').textContent = text; $('confirmBox').hidden = false; status(CONFIRM_HINT);
+  // Answers only count once the question has finished, so its echo cannot answer itself.
+  audioChain.then(() => {
+    const left = $('tts').checked && player ? Math.max(0, playAt - player.currentTime) : 0;
+    setTimeout(() => {
+      if (confirming === rid) ws.send(JSON.stringify({type:'confirm_ready', request_id:rid}));
+    }, left * 1000 + 300);
+  });
+}
+function answerConfirm(approved) {
+  if (confirming !== null) ws.send(JSON.stringify({type:'confirm_reply', request_id:confirming, approved}));
+}
 function nextTurn() {
-  ++requestId; stopPlayback(); replyBubble = null; replyActive = false;
+  ++requestId; stopPlayback(); replyBubble = null; replyActive = false; endConfirm();
   ws.send(JSON.stringify({type: 'interrupt', request_id: requestId}));
   return requestId;
 }
@@ -126,12 +142,13 @@ function handleVoice({event, text, reason, chance}) {
   if (event === 'stop') { nextTurn(); status(LISTEN_HINT); }
   if (event === 'ignored') {
     duck(false);
-    status(speaking ? PLAYING_HINT : `${IGNORED[reason] || IGNORED.noise}，待命中`);
+    if (confirming !== null) status(`${IGNORED[reason] || IGNORED.noise}；${CONFIRM_HINT}`);
+    else status(speaking ? PLAYING_HINT : `${IGNORED[reason] || IGNORED.noise}，待命中`);
   }
   if (event === 'question') {
     const rid = nextTurn();
     bubble('user', text); status('思考中…'); replyActive = true;
-    ws.send(JSON.stringify({type:'text', request_id:rid, text}));
+    ws.send(JSON.stringify({type:'text', request_id:rid, text, source:'listen'}));
   }
 }
 function listen(chunk) {
@@ -283,6 +300,8 @@ $('listen').onchange = async () => {
 $('micTest').onclick = () => testMicrophones().catch(error => status('诊断失败：' + error.message));
 $('stop').onclick = () => { closeRecording(); nextTurn(); status('已打断，可重新说话'); };
 $('tts').onchange = () => { if (!$('tts').checked) stopPlayback(); };
+$('confirmYes').onclick = () => answerConfirm(true);
+$('confirmNo').onclick = () => answerConfirm(false);
 $('form').onsubmit = async event => {
   event.preventDefault(); const text = $('text').value.trim(); if (!text || ws.readyState !== 1) return;
   closeRecording(); const rid = nextTurn(); await unlockAudio();
@@ -294,7 +313,7 @@ function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
   ws.onopen = () => { status('已连接，可以开始'); for(const id of ['mic','stop','send']) $(id).disabled=false; };
   ws.onclose = () => {
-    ++requestId; closeRecording(); stopPlayback(); stopListening(); $('listen').checked = false;
+    ++requestId; closeRecording(); stopPlayback(); stopListening(); $('listen').checked = false; endConfirm();
     replyActive = false; status('连接已断开，正在重连…');
     setTimeout(connect, 1500);
     for(const id of ['mic','stop','send']) $(id).disabled=true;
@@ -309,6 +328,8 @@ function connect() {
       $('history').scrollTop = $('history').scrollHeight;
     }
     if (['status','error','warning'].includes(message.type)) status(message.text);
+    if (message.type === 'confirm_request') askConfirm(rid, message.text);
+    if (message.type === 'confirm_done') { endConfirm(); duck(false); status(message.approved ? '已确认，正在执行…' : '已取消，操作未执行'); }
     if (message.type === 'done' && !message.tts_failed) status('回复完成；可以继续说话或打断播报');
     if (message.type === 'done' || message.type === 'error') replyActive = false;
     if (message.type === 'audio' && $('tts').checked) {

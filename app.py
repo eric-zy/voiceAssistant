@@ -26,6 +26,7 @@ from agent_loop import build_system_prompt, run_turn
 from conversation import Conversation
 from fillers import FillerCache, PHRASE as FILLER_PHRASE
 from llm_client import ToolCallStarted, stream_chat
+from memory_store import ActionLog
 from tools import default_registry
 from urllib.parse import urlsplit
 from windows_asyncio import disconnect_logging
@@ -36,6 +37,7 @@ LLM_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 API_KEY = normalize_key(os.getenv("DEEPSEEK_API_KEY", ""))
 DEFAULT_CITY = os.getenv("VOICE_DEFAULT_CITY", "").strip()
 fillers = FillerCache()
+action_log = ActionLog(ROOT / "data" / "agent.db")
 ASR_MODEL = os.getenv("VOICE_ASR_MODEL", str(ROOT / "models" / "whisper-base"))
 voice_store = VoiceStore(ROOT / "voices")
 saved_voice = voice_store.settings()
@@ -62,6 +64,13 @@ BARGE_IN_MAX_SECONDS = 8
 ASR_TIMEOUT_SECONDS = 8
 # Measured: speech, even a lone 对, stays under .4; invented text from noise is over .5.
 NO_SPEECH_LIMIT = .45
+# Whole-utterance matches only: anything misheard falls through to not doing it.
+CONFIRM_YES = {"确认", "确定执行"}
+CONFIRM_NO = {"取消", "不要", "算了"}
+CONFIRM_SUFFIX = "请说确认或取消。"
+CONFIRM_SECONDS = 20
+CONFIRM_READY_SECONDS = 30
+PCM_BYTES_PER_SECOND = 32000
 latency_log = logging.getLogger("uvicorn.error")
 @contextlib.asynccontextmanager
 async def lifespan(application):
@@ -102,6 +111,40 @@ def hearing_action(heard: str, playing: str = "", active: bool = False, partial:
     if partial:
         return "interrupt", ""
     return ("stop" if stop else "question"), ""
+
+
+def confirmation_action(heard: str, playing: str, armed: bool):
+    """Decide what an utterance does to a pending confirmation; returns (action, reason ignored).
+
+    armed means the question finished playing before this utterance began. Echo is only checked
+    before that: afterwards the prompt, which contains 确认, is still in the recent text.
+    """
+    words = re.sub(r"[\W_]+", "", heard)
+    if not words:
+        return "ignored", "noise"
+    if not armed and is_own_voice(heard, playing):
+        return "ignored", "echo"
+    if words in CONFIRM_YES:
+        return ("approve", "") if armed else ("ignored", "early")
+    if words in CONFIRM_NO or STOP_COMMAND.fullmatch(heard.strip()):
+        return "deny", ""
+    return "question", ""
+
+
+class PendingConfirmation:
+    def __init__(self):
+        self.result = asyncio.get_running_loop().create_future()
+        self.spoken = asyncio.Event()
+        self.armed_at = None
+
+    def accepts(self, started):
+        # Judged by when speech began: the tail of the prompt can finish transcribing after arming.
+        return self.armed_at is not None and started >= self.armed_at
+
+    def answer(self, approved, detail):
+        if not self.result.done():
+            self.result.set_result((approved, detail))
+        self.spoken.set()
 
 
 def transcribe(pcm: bytes) -> str:
@@ -361,6 +404,7 @@ async def websocket(ws: WebSocket):
     playing_text = recent_text = ""
     paused = interrupted = False
     request_id = 0
+    confirmation = None
     send_lock = asyncio.Lock()
 
     async def send(kind, rid, **data):
@@ -392,13 +436,14 @@ async def websocket(ws: WebSocket):
             return
         if event == "sustained":
             # Confirm with Whisper while paused, so a cough costs a moment, not the reply.
-            if playing_text:
+            # A confirmation question must finish playing, so it is never paused.
+            if playing_text and not confirmation:
                 paused = True
                 await voice("pause")
-                hear_queue.put_nowait((audio, True))
+                hear_queue.put_nowait((audio, True, 0))
             return
         if event == "end":
-            hear_queue.put_nowait((audio, False))
+            hear_queue.put_nowait((audio, False, time.monotonic() - len(audio) / PCM_BYTES_PER_SECOND))
             event = "transcribing"
         await voice(event)
 
@@ -406,7 +451,12 @@ async def websocket(ws: WebSocket):
         # One worker, and every failure counts as hearing nothing: listening cannot get stuck.
         nonlocal paused, interrupted
         while True:
-            audio, partial = await hear_queue.get()
+            audio, partial, started = await hear_queue.get()
+            if partial and confirmation:
+                if paused:
+                    paused = False
+                    await voice("resume")
+                continue
             if partial and not hear_queue.empty():
                 continue
             try:
@@ -416,6 +466,19 @@ async def websocket(ws: WebSocket):
             except Exception:
                 latency_log.exception("hands-free transcription failed")
                 heard = ""
+            if confirmation and not partial:
+                action, reason = confirmation_action(heard, recent_text, confirmation.accepts(started))
+                # Only with the demo on: real use should not keep what people say here.
+                if default_registry.get("demo_confirm"):
+                    action_log.record("confirm_heard", {}, "listen", action, heard)
+                if action == "ignored":
+                    await voice("ignored", reason=reason)
+                elif action == "question":
+                    # The page starts a new turn, which cancels the reply and so the confirmation.
+                    await voice("question", text=heard)
+                else:
+                    confirmation.answer(action == "approve", "voice:" + heard)
+                continue
             active = reply_active()
             action, reason = hearing_action(heard, recent_text if active else "", active, partial)
             if partial:
@@ -431,7 +494,7 @@ async def websocket(ws: WebSocket):
             else:
                 await voice(action, text=heard if action == "question" else "")
 
-    async def reply(rid, text=None, audio=None):
+    async def reply(rid, text=None, audio=None, source="text"):
         worker = None
         tts_failed = False
         started = time.perf_counter()
@@ -464,6 +527,9 @@ async def websocket(ws: WebSocket):
                     sentence = await queue.get()
                     if sentence is None:
                         return
+                    if isinstance(sentence, asyncio.Event):
+                        sentence.set()
+                        continue
                     if failed:
                         continue
                     try:
@@ -522,12 +588,41 @@ async def websocket(ws: WebSocket):
                         break
                     await queue.put(sentence)
 
+            async def confirm(tool, arguments):
+                nonlocal pending, confirmation
+                prompt = tool.confirm_text + CONFIRM_SUFFIX
+                if pending.strip():
+                    await queue.put(pending)
+                    pending = ""
+                current = confirmation = PendingConfirmation()
+                sent = asyncio.Event()
+                try:
+                    await send("token", rid, text=prompt)
+                    await queue.put(prompt)
+                    await queue.put(sent)
+                    await sent.wait()
+                    await send("confirm_request", rid, text=prompt)
+                    try:
+                        await asyncio.wait_for(current.spoken.wait(), CONFIRM_READY_SECONDS)
+                        current.armed_at = time.monotonic()
+                        approved, detail = await asyncio.wait_for(asyncio.shield(current.result), CONFIRM_SECONDS)
+                    except TimeoutError:
+                        approved, detail = False, "timeout"
+                finally:
+                    confirmation = None
+                await send("confirm_done", rid, approved=approved)
+                return approved, detail
+
+            def audit(tool, arguments, outcome, detail):
+                action_log.record(tool, arguments, source, outcome, detail)
+
             def chat(messages, **options):
                 return stream_chat(DEEPSEEK_URL, API_KEY, LLM_MODEL, messages, **options)
 
             user_message = {"role": "user", "content": text}
             system_message = {"role": "system", "content": build_system_prompt(SYSTEM, DEFAULT_CITY)}
-            added = await run_turn([system_message, *history.messages(), user_message], default_registry, chat, on_llm_event)
+            added = await run_turn([system_message, *history.messages(), user_message], default_registry, chat, on_llm_event,
+                                   confirm, audit)
             mark("llm_done")
             if pending.strip():
                 await queue.put(pending)
@@ -580,7 +675,11 @@ async def websocket(ws: WebSocket):
             rid = data.get("request_id")
             if not isinstance(rid, int) or rid < request_id:
                 continue
-            if kind in {"interrupt", "text", "audio_start"}:
+            if kind == "confirm_ready" and confirmation and rid == request_id:
+                confirmation.spoken.set()
+            elif kind == "confirm_reply" and confirmation and rid == request_id:
+                confirmation.answer(data.get("approved") is True, "button")
+            elif kind in {"interrupt", "text", "audio_start"}:
                 await stop()
                 request_id = rid
                 pcm.clear()
@@ -592,10 +691,11 @@ async def websocket(ws: WebSocket):
                     if not 1 <= len(text) <= 2000:
                         await send("error", rid, text="请输入 1～2000 字")
                     else:
-                        task = asyncio.create_task(reply(rid, text=text))
+                        source = "listen" if data.get("source") == "listen" else "text"
+                        task = asyncio.create_task(reply(rid, text=text, source=source))
             elif kind == "audio_end" and recording and rid == request_id:
                 recording = False
-                task = asyncio.create_task(reply(rid, audio=bytes(pcm)))
+                task = asyncio.create_task(reply(rid, audio=bytes(pcm), source="audio"))
                 pcm.clear()
     except (WebSocketDisconnect, json.JSONDecodeError):
         pass

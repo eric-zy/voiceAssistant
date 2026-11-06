@@ -4,6 +4,7 @@ import contextlib
 import time
 
 from llm_client import TextDelta, ToolCall
+from tools import no_audit
 
 MAX_TOOL_ROUNDS = 3
 TOOL_RULES = ("需要实时信息时才调用工具，闲聊和常识问题直接回答。调用工具之前不要说话，也不要声称已经完成。"
@@ -21,7 +22,14 @@ def assistant_message(content, calls):
         {"id": call.id, "type": "function", "function": {"name": call.name, "arguments": call.arguments}} for call in calls]}
 
 
-async def run_turn(messages, registry, chat, on_event):
+async def run_calls(calls, registry, confirm, audit):
+    if all(registry.is_read(call.name) for call in calls):
+        return await asyncio.gather(*(registry.execute(call) for call in calls))
+    # One at a time: the user can only answer one confirmation, and writes keep their order.
+    return [await registry.execute(call, confirm, audit) for call in calls]
+
+
+async def run_turn(messages, registry, chat, on_event, confirm=None, audit=no_audit):
     """Return the messages this turn added. Text and tool starts reach on_event as they stream."""
     added = []
     for round_number in range(MAX_TOOL_ROUNDS + 1):
@@ -40,5 +48,5 @@ async def run_turn(messages, registry, chat, on_event):
             added.append({"role": "assistant", "content": content})
             return added
         added.append(assistant_message(content, calls))
-        results = await asyncio.gather(*(registry.execute(call) for call in calls))
+        results = await run_calls(calls, registry, confirm, audit)
         added.extend({"role": "tool", "tool_call_id": call.id, "content": result} for call, result in zip(calls, results))

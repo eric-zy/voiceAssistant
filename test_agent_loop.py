@@ -128,3 +128,29 @@ def test_the_clock_ends_the_prompt_so_the_prefix_stays_cacheable():
 
 def test_no_default_city_is_invented():
     assert "默认城市" not in build_system_prompt("基础。")
+
+
+async def _noop(event):
+    pass
+
+
+def test_writes_run_one_at_a_time_in_order():
+    order = []
+
+    async def run(city):
+        order.append("start " + city)
+        await asyncio.sleep(0)
+        order.append("end " + city)
+        return {}
+
+    chat, _ = scripted([call(1, "北京"), call(2, "上海")], [TextDelta("好")])
+    asyncio.run(run_turn(USER, registry(run, level="reversible"), chat, _noop))
+    assert order == ["start 北京", "end 北京", "start 上海", "end 上海"]
+
+
+def test_the_model_hears_that_a_confirmation_was_refused():
+    async def confirm(tool, arguments):
+        return False, "voice:取消"
+    chat, _ = scripted([call()], [TextDelta("已取消")])
+    added = asyncio.run(run_turn(USER, registry(level="confirm", confirm_text="要执行吗？"), chat, _noop, confirm))
+    assert json.loads(added[1]["content"])["cancelled"] is True and added[-1]["content"] == "已取消"

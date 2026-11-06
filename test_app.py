@@ -467,3 +467,241 @@ def test_the_prompt_carries_the_clock_and_the_default_city(monkeypatch):
             ask(socket, 1)
     system = requests[0]["messages"][0]["content"]
     assert system.startswith(backend.SYSTEM) and "用户默认城市：苏州" in system and "当前时间：" in system
+
+
+PROMPT = "要执行演示操作吗？请说确认或取消。"
+
+
+@pytest.mark.parametrize("heard,action", [
+    ("确认", "approve"), ("确认。", "approve"), ("确定执行", "approve"),
+    ("取消", "deny"), ("不要", "deny"), ("算了", "deny"), ("停", "deny"), ("别说了", "deny"),
+    ("好", "question"), ("嗯", "question"), ("是", "question"), ("确认吗", "question"), ("不确认", "question"), ("今天天气怎么样", "question")])
+def test_only_a_full_yes_approves(heard, action):
+    assert backend.confirmation_action(heard, PROMPT, True)[0] == action
+
+
+@pytest.mark.parametrize("heard,reason", [("确认", "echo"), ("请说确认或取消", "echo"), ("取消", "echo"), ("演示操作", "echo"), ("", "noise")])
+def test_the_question_cannot_answer_itself_while_it_plays(heard, reason):
+    assert backend.confirmation_action(heard, PROMPT, False) == ("ignored", reason)
+
+
+def test_a_yes_before_the_question_finished_does_not_count():
+    assert backend.confirmation_action("确认", "别的内容", False) == ("ignored", "early")
+
+
+def test_the_prompt_still_in_recent_text_does_not_block_a_real_yes():
+    assert backend.confirmation_action("确认", PROMPT, True)[0] == "approve"
+
+
+def confirm_session(monkeypatch, tmp_path, script=()):
+    """Fake DeepSeek calling a confirm tool, with the action log in tmp_path; returns (ran, log, requests)."""
+    import httpx, json
+    requests, ran = [], []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if body["messages"][-1]["role"] == "tool":
+            return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"处理好了。"}}]}\n\ndata: [DONE]\n\n')
+        if "聊天" in body["messages"][-1]["content"]:
+            return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"聊聊吧。"}}]}\n\ndata: [DONE]\n\n')
+        call = {"index": 0, "id": "c1", "type": "function", "function": {"name": "risky", "arguments": "{}"}}
+        return httpx.Response(200, text='data: ' + json.dumps({"choices": [{"delta": {"tool_calls": [call]}, "finish_reason": "tool_calls"}]}) + '\n\ndata: [DONE]\n\n')
+    original = httpx.AsyncClient
+    monkeypatch.setattr(backend.httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(backend, "API_KEY", "test-key")
+    monkeypatch.setattr(backend, "TTS_PROVIDER", "edge")
+
+    async def fake_synthesize(text):
+        return b"fake-wav"
+    monkeypatch.setattr(backend, "synthesize", fake_synthesize)
+
+    async def risky():
+        ran.append(True)
+        return {"done": True}
+    tool = backend.default_registry.get("get_weather")
+    monkeypatch.setitem(backend.default_registry.tools, "risky", dataclasses.replace(
+        tool, name="risky", parameters={"type": "object", "properties": {}}, run=risky, filler=False, level="confirm", confirm_text="要执行演示操作吗？"))
+    log = backend.ActionLog(tmp_path / "agent.db")
+    monkeypatch.setattr(backend, "action_log", log)
+    monkeypatch.setattr(backend, "TurnDetector", ScriptedDetector)
+    monkeypatch.setattr(ScriptedDetector, "script", list(script))
+    return ran, log, requests
+
+
+def receive_until(socket, *kinds):
+    messages = []
+    while True:
+        messages.append(socket.receive_json())
+        assert messages[-1]["type"] != "error", messages[-1]
+        if messages[-1]["type"] in kinds:
+            return messages
+
+
+def next_voice(socket, event):
+    while True:
+        message = socket.receive_json()
+        if message.get("event") == event:
+            return message
+
+
+class ConfirmTalk:
+    """Open a socket, ask, and stop at the confirmation question."""
+    def __init__(self, ready=True, source="listen"):
+        self.ready, self.source = ready, source
+
+    def __enter__(self):
+        self.client = TestClient(backend.app)
+        self.client.__enter__()
+        self.context = self.client.websocket_connect("/ws", headers={"origin": "http://127.0.0.1:8765"})
+        self.socket = self.context.__enter__()
+        self.socket.send_json({"type": "listen_start"})
+        self.socket.send_json({"type": "text", "request_id": 1, "text": "清空吧", "source": self.source})
+        self.before = receive_until(self.socket, "confirm_request")
+        if self.ready:
+            self.socket.send_json({"type": "confirm_ready", "request_id": 1})
+            # Speech must begin after arming, and a scripted utterance claims to be 0.2 seconds long.
+            time.sleep(.3)
+        return self.socket
+
+    def __exit__(self, *error):
+        self.context.__exit__(*error)
+        self.client.__exit__(*error)
+
+
+SAID = [[("end", b"\0" * 6400)]]
+
+
+def test_saying_confirm_runs_the_tool_and_logs_who_said_it(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "transcribe", lambda pcm: "确认")
+    ran, log, _ = confirm_session(monkeypatch, tmp_path, SAID)
+    talk = ConfirmTalk()
+    with talk as socket:
+        socket.send_bytes(b"\0\0")
+        messages = receive_until(socket, "done")
+    types = [m["type"] for m in talk.before]
+    assert [m["text"] for m in talk.before if m["type"] == "audio"] == [PROMPT] and types.index("audio") < types.index("confirm_request")
+    assert {"type": "confirm_done", "request_id": 1, "approved": True} in messages
+    assert ran == [True]
+    assert log.recent() == [{"tool": "risky", "arguments": {}, "source": "listen", "outcome": "executed", "detail": "voice:确认"}]
+
+
+def test_saying_cancel_runs_nothing_and_the_model_is_told(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "transcribe", lambda pcm: "取消")
+    ran, log, requests = confirm_session(monkeypatch, tmp_path, SAID)
+    with ConfirmTalk() as socket:
+        socket.send_bytes(b"\0\0")
+        messages = receive_until(socket, "done")
+    assert {"type": "confirm_done", "request_id": 1, "approved": False} in messages
+    assert not ran and '"cancelled": true' in requests[-1]["messages"][-1]["content"]
+    assert log.recent()[0]["outcome"] == "denied"
+
+
+def test_an_utterance_that_began_during_the_question_cannot_approve(monkeypatch, tmp_path):
+    # Transcribed after arming, but five seconds long: it started while the prompt was playing.
+    monkeypatch.setattr(backend, "transcribe", lambda pcm: "确认")
+    ran, _, _ = confirm_session(monkeypatch, tmp_path, [[("end", b"\0" * 160000)]])
+    with ConfirmTalk() as socket:
+        socket.send_bytes(b"\0\0")
+        event = next_voice(socket, "ignored")
+        socket.send_json({"type": "interrupt", "request_id": 2})
+    assert event["reason"] == "early" and not ran
+
+
+def test_echo_during_the_question_is_ignored_and_it_stays_open(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "transcribe", lambda pcm: "请说确认或取消")
+    ran, _, _ = confirm_session(monkeypatch, tmp_path, SAID)
+    with ConfirmTalk(ready=False) as socket:
+        socket.send_json({"type": "playing", "text": PROMPT, "recent": PROMPT})
+        socket.send_bytes(b"\0\0")
+        event = next_voice(socket, "ignored")
+        socket.send_json({"type": "confirm_reply", "request_id": 1, "approved": True})
+        receive_until(socket, "done")
+    assert event["reason"] == "echo" and ran == [True]
+
+
+def test_speech_never_pauses_the_question(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "transcribe", lambda pcm: "确认")
+    ran, _, _ = confirm_session(monkeypatch, tmp_path, [[("sustained", b"\0" * 6400)], *SAID])
+    with ConfirmTalk() as socket:
+        socket.send_json({"type": "playing", "text": PROMPT, "recent": PROMPT})
+        socket.send_bytes(b"\0\0")
+        socket.send_bytes(b"\0\0")
+        messages = receive_until(socket, "done")
+    assert not any(m.get("event") == "pause" for m in messages) and ran == [True]
+
+
+def test_silence_times_out_and_runs_nothing(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "CONFIRM_SECONDS", .05)
+    ran, log, _ = confirm_session(monkeypatch, tmp_path)
+    with ConfirmTalk() as socket:
+        messages = receive_until(socket, "done")
+    assert {"type": "confirm_done", "request_id": 1, "approved": False} in messages
+    assert not ran and log.recent()[0]["detail"] == "timeout"
+
+
+def test_a_page_that_never_reports_playback_also_times_out(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "CONFIRM_READY_SECONDS", .05)
+    ran, log, _ = confirm_session(monkeypatch, tmp_path)
+    with ConfirmTalk(ready=False) as socket:
+        receive_until(socket, "done")
+    assert not ran and log.recent()[0]["detail"] == "timeout"
+
+
+@pytest.mark.parametrize("approved,expected", [(True, [True]), (False, [])])
+def test_the_buttons_answer_too(monkeypatch, tmp_path, approved, expected):
+    ran, log, _ = confirm_session(monkeypatch, tmp_path)
+    with ConfirmTalk(source="text") as socket:
+        socket.send_json({"type": "confirm_reply", "request_id": 1, "approved": approved})
+        receive_until(socket, "done")
+    assert ran == expected
+    assert log.recent()[0]["source"] == "text" and log.recent()[0]["detail"] == "button"
+
+
+def test_only_a_literal_true_approves_from_the_page(monkeypatch, tmp_path):
+    ran, _, _ = confirm_session(monkeypatch, tmp_path)
+    with ConfirmTalk() as socket:
+        socket.send_json({"type": "confirm_reply", "request_id": 1, "approved": "false"})
+        receive_until(socket, "done")
+    assert not ran
+
+
+def test_an_answer_for_an_older_turn_is_ignored(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "CONFIRM_SECONDS", .2)
+    ran, _, _ = confirm_session(monkeypatch, tmp_path)
+    with ConfirmTalk() as socket:
+        socket.send_json({"type": "confirm_reply", "request_id": 0, "approved": True})
+        receive_until(socket, "done")
+    assert not ran
+
+
+def test_interrupting_cancels_and_the_next_turn_works(monkeypatch, tmp_path):
+    ran, log, _ = confirm_session(monkeypatch, tmp_path)
+    with ConfirmTalk() as socket:
+        socket.send_json({"type": "interrupt", "request_id": 2})
+        socket.send_json({"type": "text", "request_id": 3, "text": "聊天"})
+        messages = receive_until(socket, "done")
+    assert "聊聊吧。" in [m.get("text") for m in messages]
+    assert not ran and log.recent()[0]["outcome"] == "interrupted"
+
+
+def test_saying_something_else_becomes_a_new_question(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "transcribe", lambda pcm: "今天天气怎么样")
+    ran, _, _ = confirm_session(monkeypatch, tmp_path, SAID)
+    with ConfirmTalk() as socket:
+        socket.send_bytes(b"\0\0")
+        question = next_voice(socket, "question")
+        socket.send_json({"type": "interrupt", "request_id": 2})
+    assert question["text"] == "今天天气怎么样" and not ran
+
+
+@pytest.mark.parametrize("demo,expected", [(True, 1), (False, 0)])
+def test_what_was_heard_is_kept_only_in_demo_mode(monkeypatch, tmp_path, demo, expected):
+    monkeypatch.setattr(backend, "transcribe", lambda pcm: "确认")
+    _, log, _ = confirm_session(monkeypatch, tmp_path, SAID)
+    if demo:
+        monkeypatch.setitem(backend.default_registry.tools, "demo_confirm", backend.default_registry.get("risky"))
+    with ConfirmTalk() as socket:
+        socket.send_bytes(b"\0\0")
+        receive_until(socket, "done")
+    assert sum(row["tool"] == "confirm_heard" for row in log.recent()) == expected

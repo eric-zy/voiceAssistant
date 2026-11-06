@@ -299,3 +299,64 @@ test('listening starts with browser noise suppression on until a test proves oth
   assert.match(source,/MIC_MODES = \[\s*\{label:'降噪\+增益', noiseSuppression:true, autoGainControl:true\}/);
 });
 
+
+function confirmPage() {
+  const elements = new Map();
+  const get = id => {
+    if (!elements.has(id)) elements.set(id,{textContent:'',checked:true,disabled:false,value:'',hidden:true,append(){},remove(){}});
+    return elements.get(id);
+  };
+  const timers = [], sent = [];
+  const context = {document:{getElementById:get},location:{host:'127.0.0.1:8765'},atob,Uint8Array,console,navigator:{},
+    fetch:async()=>({json:async()=>({})}),setTimeout:(run,ms)=>timers.push({run,ms}),clearTimeout(){},setInterval(){},clearInterval(){},
+    localStorage:{getItem:()=>null,setItem(){}},WebSocket:function(){context.socket=this;this.send=text=>sent.push(JSON.parse(text))}};
+  context.window=context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/speech.js','utf8'),context);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/app.js','utf8'),context);
+  context.socket.readyState=1;
+  const receive = message => context.socket.onmessage({data:JSON.stringify(message)});
+  return {get,context,sent,timers,receive};
+}
+const tick = () => new Promise(resolve => setImmediate(resolve));
+
+test('a confirmation shows buttons and reports ready only after the question has played',async()=>{
+  const page=confirmPage();
+  page.receive({type:'confirm_request',request_id:0,text:'要执行吗？'});
+  assert.equal(page.get('confirmBox').hidden,false);
+  assert.equal(page.get('confirmText').textContent,'要执行吗？');
+  await tick();
+  assert.equal(page.sent.length,0);
+  page.timers.at(-1).run();
+  assert.deepEqual(page.sent,[{type:'confirm_ready',request_id:0}]);
+});
+
+test('the buttons send the answer for the current turn',async()=>{
+  const page=confirmPage();
+  page.receive({type:'confirm_request',request_id:0,text:'要执行吗？'});
+  page.get('confirmNo').onclick();
+  assert.deepEqual(page.sent.at(-1),{type:'confirm_reply',request_id:0,approved:false});
+  page.get('confirmYes').onclick();
+  assert.equal(page.sent.at(-1).approved,true);
+});
+
+test('the server closing a confirmation hides the buttons and stops further answers',async()=>{
+  const page=confirmPage();
+  page.receive({type:'confirm_request',request_id:0,text:'要执行吗？'});
+  page.receive({type:'confirm_done',request_id:0,approved:false});
+  assert.equal(page.get('confirmBox').hidden,true);
+  assert.match(page.get('status').textContent,/已取消/);
+  const before=page.sent.length;
+  page.get('confirmYes').onclick();
+  assert.equal(page.sent.length,before);
+});
+
+test('interrupting hides the question and a late ready is not sent',async()=>{
+  const page=confirmPage();
+  page.receive({type:'confirm_request',request_id:0,text:'要执行吗？'});
+  await tick();
+  page.get('stop').onclick();
+  assert.equal(page.get('confirmBox').hidden,true);
+  page.timers.at(-1).run();
+  assert.equal(page.sent.some(message=>message.type==='confirm_ready'),false);
+});
