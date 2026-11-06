@@ -1,3 +1,4 @@
+import dataclasses
 import asyncio
 import threading
 from types import SimpleNamespace
@@ -390,3 +391,79 @@ def test_mic_test_is_only_for_the_local_page():
     with TestClient(backend.app) as client:
         assert client.post("/api/mic-test", content=b"\0\0", headers={"origin":"https://example.com"}).status_code == 403
 
+
+
+def tool_then_answer(monkeypatch):
+    """Fake DeepSeek: a weather call first, then a plain answer once the tool result is back."""
+    import httpx, json
+    requests = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if body["messages"][-1]["role"] == "tool":
+            return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"明天有雨。"}}]}\n\ndata: [DONE]\n\n')
+        call = {"index": 0, "id": f"c{len(requests)}", "type": "function", "function": {"name": "get_weather", "arguments": '{"city":"北京"}'}}
+        return httpx.Response(200, text='data: ' + json.dumps({"choices": [{"delta": {"tool_calls": [call]}, "finish_reason": "tool_calls"}]}) + '\n\ndata: [DONE]\n\n')
+    original = httpx.AsyncClient
+    monkeypatch.setattr(backend.httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(backend, "API_KEY", "test-key")
+    monkeypatch.setattr(backend, "TTS_PROVIDER", "edge")
+    monkeypatch.setattr(backend, "fillers", backend.FillerCache())
+    spoken = []
+
+    async def fake_synthesize(text):
+        spoken.append(text)
+        return b"fake-wav"
+    monkeypatch.setattr(backend, "synthesize", fake_synthesize)
+
+    async def fake_weather(city, date=""):
+        return {"place": city, "weather": "中雨"}
+    tool = backend.default_registry.get("get_weather")
+    monkeypatch.setitem(backend.default_registry.tools, "get_weather", dataclasses.replace(tool, run=fake_weather))
+    return requests, spoken
+
+
+def ask(socket, rid, text="北京明天下雨吗"):
+    socket.send_json({"type": "text", "request_id": rid, "text": text})
+    messages = []
+    while not messages or messages[-1]["type"] != "done":
+        messages.append(socket.receive_json())
+        assert messages[-1]["type"] != "error", messages[-1]
+    return messages
+
+
+def test_a_tool_turn_shows_status_speaks_the_answer_and_stays_in_history(monkeypatch):
+    requests, spoken = tool_then_answer(monkeypatch)
+    with TestClient(backend.app) as client:
+        with client.websocket_connect("/ws", headers={"origin": "http://127.0.0.1:8765"}) as socket:
+            first = ask(socket, 1)
+            ask(socket, 2)
+    assert {"type": "status", "request_id": 1, "text": "正在查询天气…"} in first
+    assert "".join(m["text"] for m in first if m["type"] == "token") == "明天有雨。"
+    assert "明天有雨。" in spoken
+    assert requests[0]["tools"][0]["function"]["name"] == "get_weather"
+    assert [m["role"] for m in requests[1]["messages"]] == ["system", "user", "assistant", "tool"]
+    # The second question sees the whole first turn, including the tool messages.
+    assert [m["role"] for m in requests[2]["messages"]] == ["system", "user", "assistant", "tool", "assistant", "user"]
+
+
+def test_filler_plays_only_once_cached_and_is_marked_for_the_echo_filter(monkeypatch):
+    _, spoken = tool_then_answer(monkeypatch)
+    with TestClient(backend.app) as client:
+        with client.websocket_connect("/ws", headers={"origin": "http://127.0.0.1:8765"}) as socket:
+            first = ask(socket, 1)
+            second = ask(socket, 2)
+    assert [m["text"] for m in first if m["type"] == "audio"] == ["明天有雨。"]
+    assert [m["text"] for m in second if m["type"] == "audio"] == [backend.FILLER_PHRASE, "明天有雨。"]
+    assert spoken.count(backend.FILLER_PHRASE) == 1
+
+
+def test_the_prompt_carries_the_clock_and_the_default_city(monkeypatch):
+    requests, _ = tool_then_answer(monkeypatch)
+    monkeypatch.setattr(backend, "DEFAULT_CITY", "苏州")
+    with TestClient(backend.app) as client:
+        with client.websocket_connect("/ws", headers={"origin": "http://127.0.0.1:8765"}) as socket:
+            ask(socket, 1)
+    system = requests[0]["messages"][0]["content"]
+    assert system.startswith(backend.SYSTEM) and "用户默认城市：苏州" in system and "当前时间：" in system

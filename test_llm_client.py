@@ -4,7 +4,7 @@ import json
 import httpx
 import pytest
 
-from llm_client import MAX_REPLY_TOKENS, TextDelta, stream_chat
+from llm_client import MAX_REPLY_TOKENS, TextDelta, ToolCall, ToolCallStarted, stream_chat
 
 
 @pytest.fixture
@@ -73,3 +73,54 @@ def test_an_error_inside_the_stream_stops_it(serve):
     with pytest.raises(RuntimeError, match="DeepSeek 返回错误"):
         asyncio.run(run())
     assert events == [TextDelta("半")]
+
+
+def tool_piece(index=0, arguments="", **first):
+    return {"index": index, "function": {"arguments": arguments, **({"name": first["name"]} if first else {})},
+            **({"id": first["id"], "type": "function"} if first else {})}
+
+
+def tool_stream(*pieces, finish="tool_calls"):
+    lines = ['data: ' + json.dumps({"choices": [{"delta": {"tool_calls": [piece]}}]}) for piece in pieces]
+    return sse(*lines, 'data: ' + json.dumps({"choices": [{"delta": {}, "finish_reason": finish}]}), 'data: [DONE]')
+
+
+def test_tool_call_pieces_are_joined_and_announced_early(serve):
+    serve(tool_stream(tool_piece(id="c1", name="get_weather"), tool_piece(arguments='{"ci'), tool_piece(arguments='ty":"x"}')))
+    assert collect() == [ToolCallStarted("get_weather"), ToolCall("c1", "get_weather", '{"city":"x"}')]
+
+
+def test_parallel_calls_stay_separate_even_when_interleaved(serve):
+    serve(tool_stream(tool_piece(0, id="a", name="one"), tool_piece(1, id="b", name="two"), tool_piece(1, "{2}"), tool_piece(0, "{1}")))
+    assert collect() == [ToolCallStarted("one"), ToolCallStarted("two"), ToolCall("a", "one", "{1}"), ToolCall("b", "two", "{2}")]
+
+
+def test_text_can_come_before_a_tool_call(serve):
+    serve(sse('data: {"choices":[{"delta":{"content":"我看看"}}]}',
+              'data: ' + json.dumps({"choices": [{"delta": {"tool_calls": [tool_piece(id="c", name="t", arguments="{}")]}, "finish_reason": "tool_calls"}]})))
+    assert collect() == [TextDelta("我看看"), ToolCallStarted("t"), ToolCall("c", "t", "{}")]
+
+
+def test_a_cut_off_tool_call_never_runs(serve):
+    serve(tool_stream(tool_piece(id="c", name="t", arguments='{"a":"1"}'), finish="length"))
+    events = []
+
+    async def run():
+        async for event in stream_chat("https://api.test", "test-key", "test-model", []):
+            events.append(event)
+
+    with pytest.raises(RuntimeError, match="工具调用不完整"):
+        asyncio.run(run())
+    assert events == [ToolCallStarted("t")]
+
+
+def test_tools_are_sent_only_when_given(serve):
+    sent = serve(sse('data: [DONE]'))
+    schemas = [{"type": "function", "function": {"name": "t"}}]
+
+    async def run():
+        async for _ in stream_chat("https://api.test", "k", "m", [], tools=schemas, tool_choice="none"):
+            pass
+    asyncio.run(run())
+    body = json.loads(sent[0].content)
+    assert body["tools"] == schemas and body["tool_choice"] == "none"

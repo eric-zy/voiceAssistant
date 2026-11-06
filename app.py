@@ -22,8 +22,11 @@ from turn_detector import TurnDetector, measure_speech
 from zhconv import convert as to_chinese_variant
 from fastapi.staticfiles import StaticFiles
 from api_config import normalize_key, fingerprint
+from agent_loop import build_system_prompt, run_turn
 from conversation import Conversation
-from llm_client import stream_chat
+from fillers import FillerCache, PHRASE as FILLER_PHRASE
+from llm_client import ToolCallStarted, stream_chat
+from tools import default_registry
 from urllib.parse import urlsplit
 from windows_asyncio import disconnect_logging
 
@@ -31,6 +34,8 @@ ROOT = Path(__file__).resolve().parent
 DEEPSEEK_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 LLM_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 API_KEY = normalize_key(os.getenv("DEEPSEEK_API_KEY", ""))
+DEFAULT_CITY = os.getenv("VOICE_DEFAULT_CITY", "").strip()
+fillers = FillerCache()
 ASR_MODEL = os.getenv("VOICE_ASR_MODEL", str(ROOT / "models" / "whisper-base"))
 voice_store = VoiceStore(ROOT / "voices")
 saved_voice = voice_store.settings()
@@ -362,6 +367,10 @@ async def websocket(ws: WebSocket):
         async with send_lock:
             await ws.send_json({"type": kind, "request_id": rid, **data})
 
+    async def send_audio(rid, audio, text):
+        await send("audio", rid, data=base64.b64encode(audio).decode("ascii"),
+                   mime="audio/wav" if audio.startswith(b"RIFF") else "audio/mpeg", text=text)
+
     async def stop():
         nonlocal task
         if task:
@@ -469,8 +478,7 @@ async def websocket(ws: WebSocket):
                                 if first_audio:
                                     mark("first_audio")
                                     first_audio = False
-                                await send("audio", rid, data=base64.b64encode(audio).decode("ascii"),
-                                           mime="audio/wav" if audio.startswith(b"RIFF") else "audio/mpeg", text=sentence)
+                                await send_audio(rid, audio, sentence)
                     except Exception as error:
                         failed = True
                         tts_failed = True
@@ -480,35 +488,53 @@ async def websocket(ws: WebSocket):
             worker = asyncio.create_task(speak_worker())
             # Bound all balanced-mode chunks, including the remainder after the lead.
             clone_full_reply = TTS_PROVIDER == "cosyvoice"
-            content, pending = "", ""
-            messages = [{"role": "system", "content": SYSTEM}] + history.messages() + [{"role": "user", "content": text}]
-            async with contextlib.aclosing(stream_chat(DEEPSEEK_URL, API_KEY, LLM_MODEL, messages)) as events:
-                async for event in events:
-                    token = event.text
-                    content += token
-                    pending += token
-                    if first_token:
-                        mark("first_text")
-                        first_token = False
-                    await send("token", rid, text=token)
-                    if clone_full_reply and CLONE_PLAYBACK == "balanced":
-                        while True:
-                            segment, pending = split_lead(pending)
-                            if segment is None:
-                                break
-                            await queue.put(segment)
-                    while not clone_full_reply:
-                        sentence, pending = split_sentence(pending)
-                        if sentence is None:
+            pending = ""
+            filler_played = False
+
+            async def on_llm_event(event):
+                nonlocal pending, first_token, filler_played
+                if isinstance(event, ToolCallStarted):
+                    mark("tool_start")
+                    tool = default_registry.get(event.name)
+                    await send("status", rid, text=tool.status if tool else "正在处理…")
+                    # Text already spoken covers the wait, and two parallel calls need one filler.
+                    if tool and tool.filler and first_token and not filler_played:
+                        filler_played = True
+                        audio = fillers.take((TTS_PROVIDER, VOICE, CLONE_ID), synthesize)
+                        if audio:
+                            await send_audio(rid, audio, FILLER_PHRASE)
+                    return
+                token = event.text
+                pending += token
+                if first_token:
+                    mark("first_text")
+                    first_token = False
+                await send("token", rid, text=token)
+                if clone_full_reply and CLONE_PLAYBACK == "balanced":
+                    while True:
+                        segment, pending = split_lead(pending)
+                        if segment is None:
                             break
-                        await queue.put(sentence)
+                        await queue.put(segment)
+                while not clone_full_reply:
+                    sentence, pending = split_sentence(pending)
+                    if sentence is None:
+                        break
+                    await queue.put(sentence)
+
+            def chat(messages, **options):
+                return stream_chat(DEEPSEEK_URL, API_KEY, LLM_MODEL, messages, **options)
+
+            user_message = {"role": "user", "content": text}
+            system_message = {"role": "system", "content": build_system_prompt(SYSTEM, DEFAULT_CITY)}
+            added = await run_turn([system_message, *history.messages(), user_message], default_registry, chat, on_llm_event)
             mark("llm_done")
             if pending.strip():
                 await queue.put(pending)
             await queue.put(None)
             await worker
             mark("all_audio_sent")
-            history.add_turn([{"role": "user", "content": text}, {"role": "assistant", "content": content}])
+            history.add_turn([user_message, *added])
             await send("done", rid, tts_failed=tts_failed)
         except asyncio.CancelledError:
             raise

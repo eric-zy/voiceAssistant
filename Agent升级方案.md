@@ -242,6 +242,8 @@ action_log(id, tool, args_json, source, result, created_at)
 - 工具运行时打断，旧结果不会被播报。
 - 分片参数、无效 JSON、超时、超过轮数上限都有测试。
 
+**结果（2026-11-06）**：有条件验收。自动验证通过，天气问答已在真实 DeepSeek 和克隆音色下跑通。提示语、打断、说“停”和闲聊的语音结果待确认；提前说话的测量推迟到阶段 4 之前。解析和与本方案的差异见 [阶段 2 解析](docs/阶段2-工具循环解析.md)。
+
 ### 阶段 3：权限和确认
 
 - 实现等级判定、`confirm` 流程、`action_log`、页面按钮。
@@ -255,6 +257,7 @@ action_log(id, tool, args_json, source, result, created_at)
 
 ### 阶段 4：记忆
 
+- 开始前先运行 `work/spike_preamble.py`，用提前说话的发生率决定是否需要缓冲首句。
 - 实现 `memory_store.py`、记忆工具、页面列表、撤销。
 - 更新 README 的隐私说明。
 
