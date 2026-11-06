@@ -1,0 +1,2 @@
+# Legacy Whisper setup.py imports pkg_resources, removed in newer setuptools.
+setuptools<81

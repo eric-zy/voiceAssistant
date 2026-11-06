@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+models/
+*.log
+.venv-cosy/
+vendor/
+voices/
+work/runtime-temp/
+work/agent-pytest*/
+outputs/*.wav
+outputs/*.mp3
+data/

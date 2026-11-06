@@ -1,0 +1,43 @@
+[
+  {
+    "mode": "stream_cold",
+    "first_audio_seconds": 16.205,
+    "total_seconds": 24.66,
+    "chunk_arrival_seconds": [
+      16.205,
+      19.917,
+      24.658
+    ],
+    "chunk_audio_seconds": [
+      1.28,
+      2.0,
+      2.6
+    ]
+  },
+  {
+    "mode": "buffered_warm",
+    "first_audio_seconds": 10.411,
+    "total_seconds": 10.412,
+    "chunk_arrival_seconds": [
+      10.411
+    ],
+    "chunk_audio_seconds": [
+      5.72
+    ]
+  },
+  {
+    "mode": "stream_warm",
+    "first_audio_seconds": 5.393,
+    "total_seconds": 15.655,
+    "chunk_arrival_seconds": [
+      5.393,
+      10.226,
+      15.652
+    ],
+    "chunk_audio_seconds": [
+      1.28,
+      2.0,
+      2.44
+    ]
+  }
+]
