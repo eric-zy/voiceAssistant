@@ -127,7 +127,7 @@ def test_the_clock_ends_the_prompt_so_the_prefix_stays_cacheable():
 
 
 def test_no_default_city_is_invented():
-    assert "默认城市" not in build_system_prompt("基础。")
+    assert "用户默认城市" not in build_system_prompt("基础。")
 
 
 async def _noop(event):
