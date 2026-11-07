@@ -94,15 +94,21 @@ def main():
         for name, text in DEMO_FILES.items():
             (folder / "docs").mkdir(exist_ok=True)
             (folder / "docs" / name).write_text(text, encoding="utf-8")
-        import tools
-        compare(KnowledgeBase(folder / "docs", folder / "index.db", tools.knowledge.embedder), DEMO_QUESTIONS)
+        compare(KnowledgeBase(folder / "docs", folder / "index.db", model()), DEMO_QUESTIONS)
         return 0
     if not QUESTIONS.exists():
         print(f"还没有问题集。先运行 --init，再编辑 {QUESTIONS}")
         return 1
     import tools
-    compare(tools.knowledge, json.loads(QUESTIONS.read_text(encoding="utf-8")))
+    # Compares with vectors even when the app has them switched off; that is the point of the run.
+    compare(KnowledgeBase(tools.knowledge.folder, tools.knowledge.index_path, model()), json.loads(QUESTIONS.read_text(encoding="utf-8")))
     return 0
+
+
+def model():
+    from embedding import Embedder
+    import tools
+    return Embedder(tools.EMBEDDING_MODEL)
 
 
 if __name__ == "__main__":

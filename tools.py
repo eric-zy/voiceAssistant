@@ -18,9 +18,16 @@ from memory_store import MemoryStore, ReminderStore
 log = logging.getLogger("uvicorn.error")
 memories = MemoryStore(Path(__file__).resolve().parent / "data" / "agent.db")
 reminders = ReminderStore(memories.path)
-# Without the model files, search falls back to words alone.
-knowledge = KnowledgeBase(Path(__file__).resolve().parent / "knowledge", memories.path.parent / "knowledge.db",
-                          Embedder(Path(__file__).resolve().parent / "models" / "bge-small-zh"))
+EMBEDDING_MODEL = Path(__file__).resolve().parent / "models" / "bge-small-zh"
+
+
+def knowledge_embedder():
+    """Vectors are off unless VOICE_KB_VECTORS=1: on the user's 198 real notes they never beat words alone,
+    and they cost about 38 ms per chunk to index. work/eval_knowledge.py compares both on any library."""
+    return Embedder(EMBEDDING_MODEL) if os.getenv("VOICE_KB_VECTORS") == "1" else None
+
+
+knowledge = KnowledgeBase(Path(__file__).resolve().parent / "knowledge", memories.path.parent / "knowledge.db", knowledge_embedder())
 MAX_MEMORY_CHARS = 200
 # Past this, say it is late instead of pretending it is on time.
 REMINDER_LATE_SECONDS = 120
