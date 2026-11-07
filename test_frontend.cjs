@@ -438,3 +438,46 @@ test('reminders are listed with their time and can be cancelled then restored',a
   await page.get('undoButton').onclick();
   assert.deepEqual(page.calls.find(call=>call[0]==='POST'),['POST','/api/reminders/2/restore']);
 });
+
+function libraryPage(files, responses=[]) {
+  const page=memoryPage();
+  page.context.encodeURIComponent=encodeURIComponent;
+  page.context.FormData=class{append(){}};
+  page.context.fetch=async(url,options={})=>{page.calls.push([options.method||'GET',url]);
+    const next=options.method?responses.shift():null;
+    return next||{ok:true,json:async()=>url==='/api/knowledge'?{files}:{memories:[]}};};
+  return page;
+}
+
+test('documents show how much text was found, or that none was',async()=>{
+  const page=libraryPage([{name:'a.pdf',chunks:3},{name:'scan.pdf',chunks:0}]);
+  await page.context.refreshKnowledge();
+  const rows=page.get('knowledgeList').children;
+  assert.equal(rows[0].children[0].textContent,'a.pdf（3 段）');
+  assert.match(rows[1].children[0].textContent,/未提取到文字/);
+});
+
+test('deleting a document asks first, and declining sends nothing',async()=>{
+  const page=libraryPage([{name:'子 目录/a.md',chunks:1}]);
+  await page.context.refreshKnowledge();
+  page.context.confirm=()=>false;
+  await page.get('knowledgeList').children[0].children[1].onclick();
+  assert.equal(page.calls.some(call=>call[0]==='DELETE'),false);
+  page.context.confirm=()=>true;
+  await page.get('knowledgeList').children[0].children[1].onclick();
+  assert.deepEqual(page.calls.find(call=>call[0]==='DELETE'),['DELETE','/api/knowledge/%E5%AD%90%20%E7%9B%AE%E5%BD%95/a.md']);
+});
+
+test('an upload reports the result and clears the picker',async()=>{
+  const page=libraryPage([],[{ok:true,json:async()=>({name:'a.pdf',chunks:0})}]);
+  const input={files:[{name:'a.pdf'}],value:'x'};
+  await page.get('knowledgeFile').onchange({target:input});
+  assert.match(page.get('status').textContent,/没有提取到文字/);
+  assert.equal(input.value,'');
+});
+
+test('a refused upload shows why',async()=>{
+  const page=libraryPage([],[{ok:false,json:async()=>({detail:'只支持 md、txt、pdf、docx 文件'})}]);
+  await page.get('knowledgeFile').onchange({target:{files:[{name:'a.exe'}],value:'x'}});
+  assert.match(page.get('status').textContent,/只支持/);
+});

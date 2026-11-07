@@ -11,3 +11,4 @@ work/agent-pytest*/
 outputs/*.wav
 outputs/*.mp3
 data/
+knowledge/

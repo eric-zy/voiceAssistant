@@ -23,8 +23,9 @@ from turn_detector import TurnDetector, measure_speech
 from zhconv import convert as to_chinese_variant
 from fastapi.staticfiles import StaticFiles
 from api_config import normalize_key, fingerprint
-from agent_loop import ToolResult, build_system_prompt, demo_chat, run_turn
+from agent_loop import ToolResult, build_system_prompt, demo_chat, run_turn, without_outside_results
 from conversation import Conversation
+from knowledge import MAX_DOCUMENT_BYTES
 from fillers import FillerCache, PHRASE as FILLER_PHRASE
 from llm_client import ToolCallStarted, stream_chat
 from memory_store import ActionLog
@@ -41,6 +42,7 @@ DEFAULT_CITY = os.getenv("VOICE_DEFAULT_CITY", "合肥").strip()
 fillers = FillerCache()
 action_log = ActionLog(ROOT / "data" / "agent.db")
 DEMO_AUDIO_DIR = ROOT / "data" / "heard"
+LATENCY_FILE = ROOT / "data" / "latency.jsonl"
 DEMO_AUDIO_KEPT = 40
 ASR_MODEL = os.getenv("VOICE_ASR_MODEL", str(ROOT / "models" / "whisper-base"))
 voice_store = VoiceStore(ROOT / "voices")
@@ -154,6 +156,16 @@ class PendingConfirmation:
         if not self.result.done():
             self.result.set_result((approved, detail))
         self.spoken.set()
+
+
+def record_latency(timings, reply_chars):
+    """Stage timings for finding what is slow. Holds seconds and a length, never what was said."""
+    try:
+        LATENCY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LATENCY_FILE.open("a", encoding="utf-8") as file:
+            file.write(json.dumps({"at": time.strftime("%H:%M:%S"), "voice": TTS_PROVIDER, "reply_chars": reply_chars, **timings}) + "\n")
+    except OSError:
+        latency_log.warning("could not write the latency file")
 
 
 def keep_demo_audio(pcm):
@@ -361,6 +373,34 @@ async def restore_memory(request: Request, memory_id: int):
     if not agent_tools.memories.restore(memory_id):
         raise HTTPException(404, "没有可恢复的记忆")
     action_log.record("restore", {"memory_id": memory_id}, "page", "executed")
+    return {"ok": True}
+
+
+@app.get("/api/knowledge")
+async def list_documents(request: Request):
+    require_local_host(request)
+    return {"files": await asyncio.to_thread(agent_tools.knowledge.list_files)}
+
+
+@app.post("/api/knowledge")
+async def upload_document(request: Request, file: UploadFile = File()):
+    require_local_page(request)
+    # One past the limit is enough to reject it without holding an arbitrarily large upload.
+    data = await file.read(MAX_DOCUMENT_BYTES + 1)
+    try:
+        saved = await asyncio.to_thread(agent_tools.knowledge.save, file.filename or "", data)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    action_log.record("upload_document", {"name": saved["name"]}, "page", "executed")
+    return saved
+
+
+@app.delete("/api/knowledge/{name:path}")
+async def delete_document(request: Request, name: str):
+    require_local_page(request)
+    if not await asyncio.to_thread(agent_tools.knowledge.delete, name):
+        raise HTTPException(404, "没有这个文件")
+    action_log.record("delete_document", {"name": name}, "page", "executed")
     return {"ok": True}
 
 
@@ -623,8 +663,12 @@ async def websocket(ws: WebSocket):
         first_audio = True
         first_token = True
 
+        timings = {}
+
         def mark(stage):
-            latency_log.info("voice_latency request=%s stage=%s seconds=%.2f", rid, stage, time.perf_counter() - started)
+            seconds = time.perf_counter() - started
+            timings.setdefault(stage, round(seconds, 2))
+            latency_log.info("voice_latency request=%s stage=%s seconds=%.2f", rid, stage, seconds)
 
         try:
             if audio is not None:
@@ -682,6 +726,7 @@ async def websocket(ws: WebSocket):
             async def on_llm_event(event):
                 nonlocal pending, first_token, filler_played
                 if isinstance(event, ToolResult):
+                    mark("tool_done")
                     if event.result.get("undo") or event.result.get("changed"):
                         await send("memory_changed", rid, text=event.result.get("say", ""), undo=event.result.get("undo"))
                     return
@@ -694,6 +739,7 @@ async def websocket(ws: WebSocket):
                         filler_played = True
                         audio = fillers.take((TTS_PROVIDER, VOICE, CLONE_ID), synthesize)
                         if audio:
+                            mark("filler")
                             await send_audio(rid, audio, FILLER_PHRASE)
                     return
                 token = event.text
@@ -760,9 +806,10 @@ async def websocket(ws: WebSocket):
             await queue.put(None)
             await worker
             mark("all_audio_sent")
-            history.add_turn([user_message, *added])
+            history.add_turn([user_message, *without_outside_results(added, default_registry)])
             finished_actions.clear()
             await send("done", rid, tts_failed=tts_failed)
+            record_latency(timings, len(added[-1].get("content") or ""))
         except asyncio.CancelledError:
             raise
         except Exception as error:

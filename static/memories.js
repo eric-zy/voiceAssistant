@@ -30,7 +30,36 @@ async function refreshReminders() {
       return refreshPanels();
     }).catch(error => status(error.message)))));
 }
-function refreshPanels() { return Promise.all([refreshMemories(), refreshReminders()]); }
+async function refreshKnowledge() {
+  const {files = []} = await (await fetch('/api/knowledge')).json();
+  $('knowledgeEmpty').hidden = files.length > 0;
+  $('knowledgeList').replaceChildren(...files.map(file => itemRow(
+    file.chunks ? `${file.name}（${file.chunks} 段）` : `${file.name}（未提取到文字）`, '删除', () => deleteDocument(file.name))));
+}
+async function deleteDocument(name) {
+  // A deleted file cannot be undone, unlike memories and reminders.
+  if (!window.confirm(`从知识库永久删除“${name}”？`)) return;
+  const path = name.split('/').map(encodeURIComponent).join('/');
+  const response = await fetch(`/api/knowledge/${path}`, {method:'DELETE'});
+  status(response.ok ? '已删除：' + name : '删除失败');
+  await refreshKnowledge();
+}
+async function uploadDocument(file) {
+  const form = new FormData(); form.append('file', file);
+  status('正在加入知识库：' + file.name);
+  const response = await fetch('/api/knowledge', {method:'POST', body:form});
+  const result = await response.json();
+  if (!response.ok) throw Error(result.detail || '上传失败');
+  status(result.chunks ? `已加入知识库：${result.name}，共 ${result.chunks} 段` : `${result.name} 没有提取到文字，可能是扫描件或已加密`);
+}
+$('knowledgeFile').onchange = async event => {
+  const input = event.target;
+  try { for (const file of input.files) await uploadDocument(file); }
+  catch (error) { status(error.message); }
+  input.value = '';
+  await refreshKnowledge().catch(() => {});
+};
+function refreshPanels() { return Promise.all([refreshMemories(), refreshReminders(), refreshKnowledge()]); }
 function offerUndo(text, undo) {
   $('undoText').textContent = text; $('undoBox').hidden = !undo;
   $('undoButton').onclick = () => changeItem(undo).then(() => {

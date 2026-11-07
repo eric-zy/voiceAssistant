@@ -124,3 +124,45 @@ def test_tools_are_sent_only_when_given(serve):
     asyncio.run(run())
     body = json.loads(sent[0].content)
     assert body["tools"] == schemas and body["tool_choice"] == "none"
+
+
+def respond_in_turn(monkeypatch, *responses):
+    sent = []
+    queue = iter(responses)
+
+    def handler(request):
+        sent.append(request)
+        return next(queue)
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    return sent
+
+
+OK_REPLY = 'data: {"choices":[{"delta":{"content":"好"}}]}\n\ndata: [DONE]\n\n'
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+def test_a_passing_outage_is_retried_without_the_user_seeing_it(monkeypatch, status):
+    sent = respond_in_turn(monkeypatch, httpx.Response(status), httpx.Response(200, text=OK_REPLY))
+    assert collect() == [TextDelta("好")] and len(sent) == 2
+
+
+def test_it_gives_up_after_three_tries_and_says_it_tried(monkeypatch):
+    sent = respond_in_turn(monkeypatch, *[httpx.Response(503) for _ in range(5)])
+    with pytest.raises(RuntimeError, match="已自动重试"):
+        collect()
+    assert len(sent) == 3
+
+
+@pytest.mark.parametrize("status", [400, 401, 402])
+def test_errors_a_retry_cannot_fix_fail_at_once(monkeypatch, status):
+    sent = respond_in_turn(monkeypatch, httpx.Response(status), httpx.Response(200, text=OK_REPLY))
+    with pytest.raises(RuntimeError):
+        collect()
+    assert len(sent) == 1
+
+
+def test_a_retry_sends_the_same_request(monkeypatch):
+    sent = respond_in_turn(monkeypatch, httpx.Response(503), httpx.Response(200, text=OK_REPLY))
+    collect([{"role": "user", "content": "你好"}])
+    assert sent[0].content == sent[1].content

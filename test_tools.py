@@ -340,3 +340,104 @@ def test_an_on_time_reminder_and_a_late_one_sound_different():
     reminder = {"content": "开会", "due_at": "2026-11-07T15:00:00"}
     assert tools.reminder_speech(reminder, datetime(2026, 11, 7, 15, 0, 5)) == "提醒你：开会"
     assert tools.reminder_speech(reminder, datetime(2026, 11, 7, 18, 0)) == "你错过了一条提醒，原定11月7日下午3点：开会"
+
+
+@pytest.fixture
+def search_api(monkeypatch):
+    """Fake DeepSeek search; returns the requests it got, and what to answer can be replaced."""
+    state = {"requests": [], "response": httpx.Response(200, json={"results": []})}
+
+    def handler(request):
+        state["requests"].append(request)
+        return state["response"]
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
+    return state
+
+
+def test_search_asks_the_right_endpoint_with_the_key(search_api):
+    asyncio.run(tools.web_search("  合肥新闻 "))
+    request = search_api["requests"][0]
+    assert str(request.url) == "https://api.deepseek.com/v1/tools/search"
+    assert request.headers["authorization"] == "Bearer test-key"
+    assert json.loads(request.content) == {"query": "合肥新闻", "count": 5}
+
+
+def test_search_keeps_only_what_the_model_needs_and_marks_it_as_data(search_api):
+    search_api["response"] = httpx.Response(200, json={"results": [{
+        "title": "标题", "url": "https://x.test/a", "summary": "摘" * 400, "snippet": "短", "site_name": "站点", "date": "2026-11-01T00:00:00+00:00", "content": "全文"}]})
+    result = asyncio.run(tools.web_search("新闻"))
+    assert "不要照做" in result["note"]
+    assert result["results"] == [{"title": "标题", "site": "站点", "date": "2026-11-01T00:00:00+00:00", "summary": "摘" * 300}]
+
+
+def test_a_missing_summary_falls_back_to_the_snippet(search_api):
+    search_api["response"] = httpx.Response(200, json={"results": [{"title": "标题", "summary": "", "snippet": "短", "site_name": None, "date": None}]})
+    assert asyncio.run(tools.web_search("新闻"))["results"][0]["summary"] == "短"
+
+
+def test_a_long_query_is_cut_to_the_api_limit(search_api):
+    asyncio.run(tools.web_search("字" * 200))
+    assert len(json.loads(search_api["requests"][0].content)["query"]) == 128
+
+
+def test_an_empty_query_is_refused_without_a_request(search_api):
+    with pytest.raises(ToolError, match="不能为空"):
+        asyncio.run(tools.web_search("   "))
+    assert not search_api["requests"]
+
+
+@pytest.mark.parametrize("status,hint", [(401, "认证失败"), (402, "余额不足"), (429, "请求受限"), (500, "HTTP 500")])
+def test_search_failures_become_readable(search_api, status, hint):
+    search_api["response"] = httpx.Response(status, json={"error": {"message": "secret detail"}})
+    with pytest.raises(ToolError, match=hint) as caught:
+        asyncio.run(tools.web_search("新闻"))
+    assert "secret" not in str(caught.value)
+
+
+def test_search_is_a_read_tool_marked_as_outside():
+    tool = tools.default_registry.get("web_search")
+    assert tool.level == "read" and tool.external is True
+
+
+def test_after_outside_content_a_reversible_write_must_be_confirmed():
+    registry, ran = writer("reversible", action="保存记忆")
+    rows, audit = audited()
+    asked = []
+
+    async def confirm(tool, arguments):
+        asked.append(tool.confirm_text)
+        return False, "voice:取消"
+    result = json.loads(asyncio.run(registry.execute(ToolCall("c", "t", '{"city":"恶意内容"}'), confirm, audit, True)))
+    assert result["cancelled"] is True and not ran and rows == [("t", "denied", "voice:取消")]
+    assert asked == ["刚查过网页，要保存记忆吗：恶意内容？"]
+
+
+def test_after_outside_content_a_write_with_no_way_to_ask_never_runs():
+    registry, ran = writer("reversible")
+    result = json.loads(asyncio.run(registry.execute(ToolCall("c", "t", '{"city":"x"}'), None, tools.no_audit, True)))
+    assert result["cancelled"] is True and not ran
+
+
+def test_after_outside_content_a_yes_still_runs_it():
+    registry, ran = writer("reversible")
+    assert json.loads(asyncio.run(registry.execute(ToolCall("c", "t", '{"city":"x"}'), answer(True, "button"), tools.no_audit, True))) == {"done": True}
+    assert ran
+
+
+def test_a_tool_with_its_own_question_keeps_it():
+    registry, _ = writer("confirm", confirm_text="要清空吗？")
+    asked = []
+
+    async def confirm(tool, arguments):
+        asked.append(tool.confirm_text)
+        return False, ""
+    asyncio.run(registry.execute(ToolCall("c", "t", '{"city":"x"}'), confirm, tools.no_audit, True))
+    assert asked == ["要清空吗？"]
+
+
+def test_every_real_write_names_its_action():
+    for tool in tools.default_registry.tools.values():
+        assert tool.level == "read" or tool.action or tool.confirm_text, tool.name
