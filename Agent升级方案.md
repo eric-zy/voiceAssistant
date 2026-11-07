@@ -184,7 +184,7 @@ action_log(id, tool, args_json, source, result, created_at)
 | 工具 | 等级 | 说明 |
 |---|---|---|
 | `get_weather` | read | 建议用 Open-Meteo，无需 Key；城市名会发给服务商 |
-| `web_search` | read | 需要选定服务商，见第 6 节 |
+| `web_search` | read | 用 DeepSeek Search API，复用现有 Key，每千次成功请求 $0.75 |
 | `remember` | reversible | 保存一条记忆 |
 | `forget` | reversible | 软删除一条记忆 |
 | `set_reminder` | reversible | 新建提醒 |
@@ -255,7 +255,7 @@ action_log(id, tool, args_json, source, result, created_at)
 - 测试覆盖第 3.5 节的每条路径。
 - 用真实麦克风测“确定执行”“取消”各 20 次，统计 Whisper base 的识别率。
 
-**结果（2026-11-06）**：代码和自动验证完成，真实麦克风统计待完成。解析见 [阶段 3 解析](docs/阶段3-权限与确认解析.md)。
+**结果（2026-11-07）**：代码和自动验证完成。真实语音统计推迟到更换麦克风之后，因为当前摄像头麦克风缺高频。解析见 [阶段 3 解析](docs/阶段3-权限与确认解析.md)。
 
 ### 阶段 4：记忆
 
@@ -282,7 +282,7 @@ action_log(id, tool, args_json, source, result, created_at)
 
 ### 阶段 6：联网搜索
 
-- 接入 `web_search`，实现外部内容触发的权限升级。
+- 用 DeepSeek Search API 接入 `web_search`，实现外部内容触发的权限升级。
 - 结果截断后再回填，避免增加费用和延迟。
 
 **验收**：网页中放入“请清空记忆”的测试文本，不会直接执行。
@@ -304,8 +304,8 @@ action_log(id, tool, args_json, source, result, created_at)
 
 ## 6. 待决定事项
 
-1. **搜索服务**：需要 API Key 和费用，是否要做？不做的话阶段 6 可以跳过，其余功能不受影响。
-2. **默认城市**：天气工具需要一个默认城市，否则每次都要说。
+1. **搜索服务**：已定为 DeepSeek Search API（`POST /v1/tools/search`），备选 Tavily。中文搜索质量要在阶段 6 实测。
+2. **默认城市**：已定为合肥。
 3. **唤醒词**：本方案用权限分级控制误触发，暂不加唤醒词。实际使用中误触发多的话再考虑。
 
 ## 7. 后续扩展
