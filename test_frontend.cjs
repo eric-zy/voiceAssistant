@@ -299,3 +299,185 @@ test('listening starts with browser noise suppression on until a test proves oth
   assert.match(source,/MIC_MODES = \[\s*\{label:'降噪\+增益', noiseSuppression:true, autoGainControl:true\}/);
 });
 
+
+function confirmPage() {
+  const elements = new Map();
+  const get = id => {
+    if (!elements.has(id)) elements.set(id,{textContent:'',checked:true,disabled:false,value:'',hidden:true,append(){},remove(){}});
+    return elements.get(id);
+  };
+  const timers = [], sent = [];
+  const context = {document:{getElementById:get},location:{host:'127.0.0.1:8765'},atob,Uint8Array,console,navigator:{},
+    fetch:async()=>({json:async()=>({})}),setTimeout:(run,ms)=>timers.push({run,ms}),clearTimeout(){},setInterval(){},clearInterval(){},
+    localStorage:{getItem:()=>null,setItem(){}},WebSocket:function(){context.socket=this;this.send=text=>sent.push(JSON.parse(text))}};
+  context.window=context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/speech.js','utf8'),context);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/app.js','utf8'),context);
+  context.socket.readyState=1;
+  const receive = message => context.socket.onmessage({data:JSON.stringify(message)});
+  return {get,context,sent,timers,receive};
+}
+const tick = () => new Promise(resolve => setImmediate(resolve));
+
+test('a confirmation shows buttons and reports ready only after the question has played',async()=>{
+  const page=confirmPage();
+  page.receive({type:'confirm_request',request_id:0,text:'要执行吗？'});
+  assert.equal(page.get('confirmBox').hidden,false);
+  assert.equal(page.get('confirmText').textContent,'要执行吗？');
+  await tick();
+  assert.equal(page.sent.length,0);
+  page.timers.at(-1).run();
+  assert.deepEqual(page.sent,[{type:'confirm_ready',request_id:0}]);
+});
+
+test('the buttons send the answer for the current turn',async()=>{
+  const page=confirmPage();
+  page.receive({type:'confirm_request',request_id:0,text:'要执行吗？'});
+  page.get('confirmNo').onclick();
+  assert.deepEqual(page.sent.at(-1),{type:'confirm_reply',request_id:0,approved:false});
+  page.get('confirmYes').onclick();
+  assert.equal(page.sent.at(-1).approved,true);
+});
+
+test('the server closing a confirmation hides the buttons and stops further answers',async()=>{
+  const page=confirmPage();
+  page.receive({type:'confirm_request',request_id:0,text:'要执行吗？'});
+  page.receive({type:'confirm_done',request_id:0,approved:false});
+  assert.equal(page.get('confirmBox').hidden,true);
+  assert.match(page.get('status').textContent,/已取消/);
+  const before=page.sent.length;
+  page.get('confirmYes').onclick();
+  assert.equal(page.sent.length,before);
+});
+
+test('interrupting hides the question and a late ready is not sent',async()=>{
+  const page=confirmPage();
+  page.receive({type:'confirm_request',request_id:0,text:'要执行吗？'});
+  await tick();
+  page.get('stop').onclick();
+  assert.equal(page.get('confirmBox').hidden,true);
+  page.timers.at(-1).run();
+  assert.equal(page.sent.some(message=>message.type==='confirm_ready'),false);
+});
+
+test('a reply whose speech failed still ends with a status saying so',()=>{
+  const page=confirmPage();
+  page.receive({type:'confirm_done',request_id:0,approved:true});
+  assert.match(page.get('status').textContent,/已确认/);
+  page.receive({type:'done',request_id:0,tts_failed:true});
+  assert.match(page.get('status').textContent,/语音播报失败/);
+  page.receive({type:'done',request_id:0,tts_failed:false});
+  assert.match(page.get('status').textContent,/回复完成；/);
+});
+
+function memoryPage(list=[]) {
+  const elements = new Map(), calls = [];
+  const get = id => {
+    if (!elements.has(id)) elements.set(id,{textContent:'',hidden:true,children:[],replaceChildren(...items){this.children=items;}});
+    return elements.get(id);
+  };
+  const create = () => ({style:{},textContent:'',append(...items){this.children=items;}});
+  const context = {$:get,document:{createElement:create},status(text){get('status').textContent=text;},console,
+    fetch:async(url,options={})=>{calls.push([options.method||'GET',url]);return {ok:true,json:async()=>({memories:list})};}};
+  context.window=context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/memories.js','utf8'),context);
+  return {get,context,calls};
+}
+
+test('memories are listed as plain text and an empty list shows the hint',async()=>{
+  const page=memoryPage([{id:3,content:'<b>不吃香菜</b>'}]);
+  await tick();
+  assert.equal(page.get('memoryEmpty').hidden,true);
+  assert.equal(page.get('memoryList').children[0].children[0].textContent,'<b>不吃香菜</b>');
+  const empty=memoryPage([]);
+  await tick();
+  assert.equal(empty.get('memoryEmpty').hidden,false);
+});
+
+test('a new memory offers undo, and undo deletes it then hides the bar',async()=>{
+  const page=memoryPage();
+  page.context.memoryChanged({text:'记住了：不吃香菜',undo:{action:'delete',id:3}});
+  assert.equal(page.get('undoBox').hidden,false);
+  assert.equal(page.get('undoText').textContent,'记住了：不吃香菜');
+  await page.get('undoButton').onclick();
+  assert.deepEqual(page.calls.find(call=>call[0]==='DELETE'),['DELETE','/api/memories/3']);
+  assert.equal(page.get('undoBox').hidden,true);
+});
+
+test('undoing a forget restores it',async()=>{
+  const page=memoryPage();
+  page.context.memoryChanged({text:'已经忘掉：不吃香菜',undo:{action:'restore',id:3}});
+  await page.get('undoButton').onclick();
+  assert.deepEqual(page.calls.find(call=>call[0]==='POST'),['POST','/api/memories/3/restore']);
+});
+
+test('clearing has nothing to undo',()=>{
+  const page=memoryPage();
+  page.context.memoryChanged({text:'已清空全部记忆',undo:null});
+  assert.equal(page.get('undoBox').hidden,true);
+});
+
+test('a due reminder starts a new turn and asks to announce it',()=>{
+  const page=confirmPage();
+  page.receive({type:'reminder_due',request_id:null,reminder_id:7});
+  assert.deepEqual(page.sent.slice(-2),[{type:'interrupt',request_id:1},{type:'announce',request_id:1,reminder_id:7}]);
+});
+
+test('reminders are listed with their time and can be cancelled then restored',async()=>{
+  const page=memoryPage();
+  page.context.fetch=async(url,options={})=>{page.calls.push([options.method||'GET',url]);
+    return {ok:true,json:async()=>url==='/api/reminders'?{reminders:[{id:2,content:'开会',due_at:'2026-11-07T15:00:00'}]}:{memories:[]}};};
+  await page.context.refreshReminders();
+  assert.equal(page.get('reminderEmpty').hidden,true);
+  const row=page.get('reminderList').children[0];
+  assert.equal(row.children[0].textContent,'2026-11-07 15:00:00 开会');
+  await row.children[1].onclick();
+  assert.deepEqual(page.calls.find(call=>call[0]==='DELETE'),['DELETE','/api/reminders/2']);
+  await page.get('undoButton').onclick();
+  assert.deepEqual(page.calls.find(call=>call[0]==='POST'),['POST','/api/reminders/2/restore']);
+});
+
+function libraryPage(files, responses=[]) {
+  const page=memoryPage();
+  page.context.encodeURIComponent=encodeURIComponent;
+  page.context.FormData=class{append(){}};
+  page.context.fetch=async(url,options={})=>{page.calls.push([options.method||'GET',url]);
+    const next=options.method?responses.shift():null;
+    return next||{ok:true,json:async()=>url==='/api/knowledge'?{files}:{memories:[]}};};
+  return page;
+}
+
+test('documents show how much text was found, or that none was',async()=>{
+  const page=libraryPage([{name:'a.pdf',chunks:3},{name:'scan.pdf',chunks:0}]);
+  await page.context.refreshKnowledge();
+  const rows=page.get('knowledgeList').children;
+  assert.equal(rows[0].children[0].textContent,'a.pdf（3 段）');
+  assert.match(rows[1].children[0].textContent,/未提取到文字/);
+});
+
+test('deleting a document asks first, and declining sends nothing',async()=>{
+  const page=libraryPage([{name:'子 目录/a.md',chunks:1}]);
+  await page.context.refreshKnowledge();
+  page.context.confirm=()=>false;
+  await page.get('knowledgeList').children[0].children[1].onclick();
+  assert.equal(page.calls.some(call=>call[0]==='DELETE'),false);
+  page.context.confirm=()=>true;
+  await page.get('knowledgeList').children[0].children[1].onclick();
+  assert.deepEqual(page.calls.find(call=>call[0]==='DELETE'),['DELETE','/api/knowledge/%E5%AD%90%20%E7%9B%AE%E5%BD%95/a.md']);
+});
+
+test('an upload reports the result and clears the picker',async()=>{
+  const page=libraryPage([],[{ok:true,json:async()=>({name:'a.pdf',chunks:0})}]);
+  const input={files:[{name:'a.pdf'}],value:'x'};
+  await page.get('knowledgeFile').onchange({target:input});
+  assert.match(page.get('status').textContent,/没有提取到文字/);
+  assert.equal(input.value,'');
+});
+
+test('a refused upload shows why',async()=>{
+  const page=libraryPage([],[{ok:false,json:async()=>({detail:'只支持 md、txt、pdf、docx 文件'})}]);
+  await page.get('knowledgeFile').onchange({target:{files:[{name:'a.exe'}],value:'x'}});
+  assert.match(page.get('status').textContent,/只支持/);
+});

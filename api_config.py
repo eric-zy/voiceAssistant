@@ -22,4 +22,6 @@ def auth_error(status: int) -> str:
         return "账户余额不足（HTTP 402），请检查 DeepSeek API 账户余额。"
     if status == 429:
         return "请求受限（HTTP 429），请稍后重试。"
+    if status in {502, 503, 504}:
+        return f"DeepSeek 服务暂时不可用（HTTP {status}），已自动重试，请稍后再说一次。"
     return f"DeepSeek 请求失败（HTTP {status}），请检查接口地址、模型名及服务状态。"

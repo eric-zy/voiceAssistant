@@ -11,17 +11,26 @@ import re
 import subprocess
 import tempfile
 import time
+import wave
 
 import httpx
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request, HTTPException
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
-from voice_clone import VoiceStore, synthesize_clone, stream_clone
+from voice_clone import CloneBusy, VoiceStore, synthesize_clone, stream_clone
 from turn_detector import TurnDetector, measure_speech
 from zhconv import convert as to_chinese_variant
 from fastapi.staticfiles import StaticFiles
-from api_config import normalize_key, fingerprint, auth_error
+from api_config import normalize_key, fingerprint
+from agent_loop import ToolResult, build_system_prompt, demo_chat, run_turn, without_outside_results
+from conversation import Conversation
+from knowledge import MAX_DOCUMENT_BYTES
+from fillers import FillerCache, PHRASE as FILLER_PHRASE
+from llm_client import ToolCallStarted, stream_chat
+from memory_store import ActionLog
+import tools as agent_tools
+from tools import default_registry
 from urllib.parse import urlsplit
 from windows_asyncio import disconnect_logging
 
@@ -29,6 +38,12 @@ ROOT = Path(__file__).resolve().parent
 DEEPSEEK_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 LLM_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 API_KEY = normalize_key(os.getenv("DEEPSEEK_API_KEY", ""))
+DEFAULT_CITY = os.getenv("VOICE_DEFAULT_CITY", "合肥").strip()
+fillers = FillerCache()
+action_log = ActionLog(ROOT / "data" / "agent.db")
+DEMO_AUDIO_DIR = ROOT / "data" / "heard"
+LATENCY_FILE = ROOT / "data" / "latency.jsonl"
+DEMO_AUDIO_KEPT = 40
 ASR_MODEL = os.getenv("VOICE_ASR_MODEL", str(ROOT / "models" / "whisper-base"))
 voice_store = VoiceStore(ROOT / "voices")
 saved_voice = voice_store.settings()
@@ -55,6 +70,18 @@ BARGE_IN_MAX_SECONDS = 8
 ASR_TIMEOUT_SECONDS = 8
 # Measured: speech, even a lone 对, stays under .4; invented text from noise is over .5.
 NO_SPEECH_LIMIT = .45
+# Whole-utterance matches only: anything misheard falls through to not doing it. The prompt asks for
+# 确定执行 because Whisper base gets it right far more often; a lone 确认 failed even on clean speech.
+CONFIRM_YES = {"确认", "确定执行"}
+CONFIRM_NO = {"取消", "不要", "算了"}
+CONFIRM_SUFFIX = "请说确定执行或取消。"
+DEMO_PHRASE = "测试确认"
+CONFIRM_SECONDS = 20
+CONFIRM_READY_SECONDS = 30
+PCM_BYTES_PER_SECOND = 32000
+# Cancelling a reply does not stop the segment on the GPU, which takes a few seconds at most.
+CLONE_BUSY_WAIT_SECONDS = 10
+REMINDER_POLL_SECONDS = 5
 latency_log = logging.getLogger("uvicorn.error")
 @contextlib.asynccontextmanager
 async def lifespan(application):
@@ -95,6 +122,62 @@ def hearing_action(heard: str, playing: str = "", active: bool = False, partial:
     if partial:
         return "interrupt", ""
     return ("stop" if stop else "question"), ""
+
+
+def confirmation_action(heard: str, playing: str, armed: bool):
+    """Decide what an utterance does to a pending confirmation; returns (action, reason ignored).
+
+    armed means the question finished playing before this utterance began. Echo is only checked
+    before that: afterwards the prompt, which contains 确认, is still in the recent text.
+    """
+    words = re.sub(r"[\W_]+", "", heard)
+    if not words:
+        return "ignored", "noise"
+    if not armed and is_own_voice(heard, playing):
+        return "ignored", "echo"
+    if words in CONFIRM_YES:
+        return ("approve", "") if armed else ("ignored", "early")
+    if words in CONFIRM_NO or STOP_COMMAND.fullmatch(heard.strip()):
+        return "deny", ""
+    return "question", ""
+
+
+class PendingConfirmation:
+    def __init__(self):
+        self.result = asyncio.get_running_loop().create_future()
+        self.spoken = asyncio.Event()
+        self.armed_at = None
+
+    def accepts(self, started):
+        # Judged by when speech began: the tail of the prompt can finish transcribing after arming.
+        return self.armed_at is not None and started >= self.armed_at
+
+    def answer(self, approved, detail):
+        if not self.result.done():
+            self.result.set_result((approved, detail))
+        self.spoken.set()
+
+
+def record_latency(timings, reply_chars):
+    """Stage timings for finding what is slow. Holds seconds and a length, never what was said."""
+    try:
+        LATENCY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LATENCY_FILE.open("a", encoding="utf-8") as file:
+            file.write(json.dumps({"at": time.strftime("%H:%M:%S"), "voice": TTS_PROVIDER, "reply_chars": reply_chars, **timings}) + "\n")
+    except OSError:
+        latency_log.warning("could not write the latency file")
+
+
+def keep_demo_audio(pcm):
+    """Keep what Whisper was given, for work/diagnose_audio.py. Demo mode only, newest clips only."""
+    DEMO_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(DEMO_AUDIO_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1000000}.wav"), "wb") as clip:
+        clip.setnchannels(1)
+        clip.setsampwidth(2)
+        clip.setframerate(16000)
+        clip.writeframes(pcm)
+    for old in sorted(DEMO_AUDIO_DIR.glob("*.wav"))[:-DEMO_AUDIO_KEPT]:
+        old.unlink()
 
 
 def transcribe(pcm: bytes) -> str:
@@ -156,11 +239,22 @@ def split_lead(pending: str):
     return None, pending
 
 
+async def synthesize_clone_when_free(profile, text):
+    deadline = time.monotonic() + CLONE_BUSY_WAIT_SECONDS
+    while True:
+        try:
+            return await synthesize_clone(profile, text, COSYVOICE_URL)
+        except CloneBusy:
+            if time.monotonic() >= deadline:
+                raise
+            await asyncio.sleep(.25)
+
+
 async def synthesize(text: str) -> bytes:
     if TTS_PROVIDER == "cosyvoice":
         try:
             profile = voice_store.get(CLONE_ID)
-            return await synthesize_clone(profile, text, COSYVOICE_URL)
+            return await synthesize_clone_when_free(profile, text)
         except (httpx.HTTPError, OSError) as error:
             raise RuntimeError("无法连接本地 CosyVoice 服务，请先运行 ./start_cosyvoice.ps1") from error
     if TTS_PROVIDER == "windows":
@@ -243,12 +337,95 @@ async def status():
             "clone_playback": CLONE_PLAYBACK,
             "tts_rate": TTS_RATE, "tts_pitch": TTS_PITCH, "api_key_configured": bool(API_KEY),
             "key_fingerprint": fingerprint(API_KEY),
-            "api_host": urlsplit(DEEPSEEK_URL).hostname, "server_pid": os.getpid(), "voice_protocol": 4}
+            "api_host": urlsplit(DEEPSEEK_URL).hostname, "server_pid": os.getpid(), "voice_protocol": 4,
+            "tools": list(default_registry.tools)}
 
 
 def require_local_page(request):
     if request.headers.get("origin") not in {"http://127.0.0.1:8765", "http://localhost:8765"}:
         raise HTTPException(403, "请通过本机项目页面操作")
+
+
+def require_local_host(request):
+    # Plain GETs carry no Origin. Checking Host stops another site reaching this through DNS rebinding.
+    if request.headers.get("host") not in {"127.0.0.1:8765", "localhost:8765"}:
+        raise HTTPException(403, "请通过本机项目页面操作")
+
+
+@app.get("/api/memories")
+async def list_memories(request: Request):
+    require_local_host(request)
+    return {"memories": agent_tools.memories.recent()}
+
+
+@app.delete("/api/memories/{memory_id}")
+async def delete_memory(request: Request, memory_id: int):
+    require_local_page(request)
+    if agent_tools.memories.forget(memory_id) is None:
+        raise HTTPException(404, "没有这条记忆")
+    action_log.record("forget", {"memory_id": memory_id}, "page", "executed")
+    return {"ok": True}
+
+
+@app.post("/api/memories/{memory_id}/restore")
+async def restore_memory(request: Request, memory_id: int):
+    require_local_page(request)
+    if not agent_tools.memories.restore(memory_id):
+        raise HTTPException(404, "没有可恢复的记忆")
+    action_log.record("restore", {"memory_id": memory_id}, "page", "executed")
+    return {"ok": True}
+
+
+@app.get("/api/knowledge")
+async def list_documents(request: Request):
+    require_local_host(request)
+    return {"files": await asyncio.to_thread(agent_tools.knowledge.list_files)}
+
+
+@app.post("/api/knowledge")
+async def upload_document(request: Request, file: UploadFile = File()):
+    require_local_page(request)
+    # One past the limit is enough to reject it without holding an arbitrarily large upload.
+    data = await file.read(MAX_DOCUMENT_BYTES + 1)
+    try:
+        saved = await asyncio.to_thread(agent_tools.knowledge.save, file.filename or "", data)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    action_log.record("upload_document", {"name": saved["name"]}, "page", "executed")
+    return saved
+
+
+@app.delete("/api/knowledge/{name:path}")
+async def delete_document(request: Request, name: str):
+    require_local_page(request)
+    if not await asyncio.to_thread(agent_tools.knowledge.delete, name):
+        raise HTTPException(404, "没有这个文件")
+    action_log.record("delete_document", {"name": name}, "page", "executed")
+    return {"ok": True}
+
+
+@app.get("/api/reminders")
+async def list_reminders(request: Request):
+    require_local_host(request)
+    return {"reminders": agent_tools.reminders.pending()}
+
+
+@app.delete("/api/reminders/{reminder_id}")
+async def delete_reminder(request: Request, reminder_id: int):
+    require_local_page(request)
+    if agent_tools.reminders.cancel(reminder_id) is None:
+        raise HTTPException(404, "没有这条提醒")
+    action_log.record("cancel_reminder", {"reminder_id": reminder_id}, "page", "executed")
+    return {"ok": True}
+
+
+@app.post("/api/reminders/{reminder_id}/restore")
+async def restore_reminder(request: Request, reminder_id: int):
+    require_local_page(request)
+    if not agent_tools.reminders.restore(reminder_id):
+        raise HTTPException(404, "没有可恢复的提醒")
+    action_log.record("restore_reminder", {"reminder_id": reminder_id}, "page", "executed")
+    return {"ok": True}
 
 
 @app.get("/api/voices")
@@ -344,7 +521,10 @@ async def websocket(ws: WebSocket):
         await ws.close(code=1008)
         return
     await ws.accept()
-    history = []
+    watcher = None
+    history = Conversation()
+    finished_actions = []
+    claimed = {}
     task = None
     pcm = bytearray()
     recording = False
@@ -354,11 +534,16 @@ async def websocket(ws: WebSocket):
     playing_text = recent_text = ""
     paused = interrupted = False
     request_id = 0
+    confirmation = None
     send_lock = asyncio.Lock()
 
     async def send(kind, rid, **data):
         async with send_lock:
             await ws.send_json({"type": kind, "request_id": rid, **data})
+
+    async def send_audio(rid, audio, text):
+        await send("audio", rid, data=base64.b64encode(audio).decode("ascii"),
+                   mime="audio/wav" if audio.startswith(b"RIFF") else "audio/mpeg", text=text)
 
     async def stop():
         nonlocal task
@@ -371,6 +556,36 @@ async def websocket(ws: WebSocket):
     def reply_active():
         return bool(playing_text) or interrupted or (task is not None and not task.done())
 
+    def can_interrupt_nobody():
+        speaking = detector is not None and getattr(detector, "audio", None) is not None
+        return not (reply_active() or recording or speaking or claimed)
+
+    async def reminder_watcher():
+        # Only an open page can speak, so a reminder stays pending until one is connected and idle.
+        while True:
+            await asyncio.sleep(REMINDER_POLL_SECONDS)
+            try:
+                if can_interrupt_nobody() and (due := agent_tools.reminders.claim_due()):
+                    claimed[due["id"]] = due
+                    await send("reminder_due", None, reminder_id=due["id"])
+            except Exception:
+                latency_log.exception("reminder check failed")
+
+    async def announce(rid, reminder):
+        text = agent_tools.reminder_speech(reminder)
+        agent_tools.reminders.mark_delivered(reminder["id"])
+        await send("token", rid, text=text)
+        failed = False
+        try:
+            async with contextlib.aclosing(synthesize_parts(text)) as parts:
+                async for audio in parts:
+                    await send_audio(rid, audio, text)
+        except Exception as error:
+            failed = True
+            reason = str(error) if isinstance(error, (ValueError, RuntimeError)) else "请检查网络及音色配置"
+            await send("warning", rid, text=f"提醒播报失败：{reason}；请看文字")
+        await send("done", rid, tts_failed=failed)
+
     async def voice(event, **data):
         await send("voice", None, event=event, **data)
 
@@ -381,13 +596,14 @@ async def websocket(ws: WebSocket):
             return
         if event == "sustained":
             # Confirm with Whisper while paused, so a cough costs a moment, not the reply.
-            if playing_text:
+            # A confirmation question must finish playing, so it is never paused.
+            if playing_text and not confirmation:
                 paused = True
                 await voice("pause")
-                hear_queue.put_nowait((audio, True))
+                hear_queue.put_nowait((audio, True, 0))
             return
         if event == "end":
-            hear_queue.put_nowait((audio, False))
+            hear_queue.put_nowait((audio, False, time.monotonic() - len(audio) / PCM_BYTES_PER_SECOND))
             event = "transcribing"
         await voice(event)
 
@@ -395,9 +611,16 @@ async def websocket(ws: WebSocket):
         # One worker, and every failure counts as hearing nothing: listening cannot get stuck.
         nonlocal paused, interrupted
         while True:
-            audio, partial = await hear_queue.get()
+            audio, partial, started = await hear_queue.get()
+            if partial and confirmation:
+                if paused:
+                    paused = False
+                    await voice("resume")
+                continue
             if partial and not hear_queue.empty():
                 continue
+            if not partial and default_registry.get("demo_confirm"):
+                keep_demo_audio(audio)
             try:
                 heard = await asyncio.wait_for(asyncio.to_thread(transcribe, audio), ASR_TIMEOUT_SECONDS)
             except ValueError:
@@ -405,6 +628,19 @@ async def websocket(ws: WebSocket):
             except Exception:
                 latency_log.exception("hands-free transcription failed")
                 heard = ""
+            if confirmation and not partial:
+                action, reason = confirmation_action(heard, recent_text, confirmation.accepts(started))
+                # Only with the demo on: real use should not keep what people say here.
+                if default_registry.get("demo_confirm"):
+                    action_log.record("confirm_heard", {}, "listen", action, heard)
+                if action == "ignored":
+                    await voice("ignored", reason=reason)
+                elif action == "question":
+                    # The page starts a new turn, which cancels the reply and so the confirmation.
+                    await voice("question", text=heard)
+                else:
+                    confirmation.answer(action == "approve", "voice:" + heard)
+                continue
             active = reply_active()
             action, reason = hearing_action(heard, recent_text if active else "", active, partial)
             if partial:
@@ -420,15 +656,19 @@ async def websocket(ws: WebSocket):
             else:
                 await voice(action, text=heard if action == "question" else "")
 
-    async def reply(rid, text=None, audio=None):
+    async def reply(rid, text=None, audio=None, source="text"):
         worker = None
         tts_failed = False
         started = time.perf_counter()
         first_audio = True
         first_token = True
 
+        timings = {}
+
         def mark(stage):
-            latency_log.info("voice_latency request=%s stage=%s seconds=%.2f", rid, stage, time.perf_counter() - started)
+            seconds = time.perf_counter() - started
+            timings.setdefault(stage, round(seconds, 2))
+            latency_log.info("voice_latency request=%s stage=%s seconds=%.2f", rid, stage, seconds)
 
         try:
             if audio is not None:
@@ -453,6 +693,9 @@ async def websocket(ws: WebSocket):
                     sentence = await queue.get()
                     if sentence is None:
                         return
+                    if isinstance(sentence, asyncio.Event):
+                        sentence.set()
+                        continue
                     if failed:
                         continue
                     try:
@@ -467,8 +710,7 @@ async def websocket(ws: WebSocket):
                                 if first_audio:
                                     mark("first_audio")
                                     first_audio = False
-                                await send("audio", rid, data=base64.b64encode(audio).decode("ascii"),
-                                           mime="audio/wav" if audio.startswith(b"RIFF") else "audio/mpeg", text=sentence)
+                                await send_audio(rid, audio, sentence)
                     except Exception as error:
                         failed = True
                         tts_failed = True
@@ -478,53 +720,96 @@ async def websocket(ws: WebSocket):
             worker = asyncio.create_task(speak_worker())
             # Bound all balanced-mode chunks, including the remainder after the lead.
             clone_full_reply = TTS_PROVIDER == "cosyvoice"
-            content, pending = "", ""
-            async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=5)) as client:
-                async with client.stream("POST", DEEPSEEK_URL + "/chat/completions",
-                    headers={"Authorization": "Bearer " + API_KEY}, json={
-                    "model": LLM_MODEL, "messages": [{"role": "system", "content": SYSTEM}] + history[-12:] +
-                    [{"role": "user", "content": text}], "stream": True,
-                    "thinking": {"type": "disabled"}, "max_tokens": 512}) as response:
-                    if response.status_code != 200:
-                        raise RuntimeError(auth_error(response.status_code))
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        payload = line[5:].strip()
-                        if payload == "[DONE]":
+            pending = ""
+            filler_played = False
+
+            async def on_llm_event(event):
+                nonlocal pending, first_token, filler_played
+                if isinstance(event, ToolResult):
+                    mark("tool_done")
+                    if event.result.get("undo") or event.result.get("changed"):
+                        await send("memory_changed", rid, text=event.result.get("say", ""), undo=event.result.get("undo"))
+                    return
+                if isinstance(event, ToolCallStarted):
+                    mark("tool_start")
+                    tool = default_registry.get(event.name)
+                    await send("status", rid, text=tool.status if tool else "正在处理…")
+                    # Text already spoken covers the wait, and two parallel calls need one filler.
+                    if tool and tool.filler and first_token and not filler_played:
+                        filler_played = True
+                        audio = fillers.take((TTS_PROVIDER, VOICE, CLONE_ID), synthesize)
+                        if audio:
+                            mark("filler")
+                            await send_audio(rid, audio, FILLER_PHRASE)
+                    return
+                token = event.text
+                pending += token
+                if first_token:
+                    mark("first_text")
+                    first_token = False
+                await send("token", rid, text=token)
+                if clone_full_reply and CLONE_PLAYBACK == "balanced":
+                    while True:
+                        segment, pending = split_lead(pending)
+                        if segment is None:
                             break
-                        chunk = json.loads(payload)
-                        if chunk.get("error"):
-                            raise RuntimeError("DeepSeek 返回错误，请检查账户及请求配置")
-                        choices = chunk.get("choices", [])
-                        token = (choices[0].get("delta", {}).get("content") or "") if choices else ""
-                        content += token
-                        pending += token
-                        if token:
-                            if first_token:
-                                mark("first_text")
-                                first_token = False
-                            await send("token", rid, text=token)
-                        if clone_full_reply and CLONE_PLAYBACK == "balanced":
-                            while True:
-                                segment, pending = split_lead(pending)
-                                if segment is None:
-                                    break
-                                await queue.put(segment)
-                        while not clone_full_reply:
-                            sentence, pending = split_sentence(pending)
-                            if sentence is None:
-                                break
-                            await queue.put(sentence)
+                        await queue.put(segment)
+                while not clone_full_reply:
+                    sentence, pending = split_sentence(pending)
+                    if sentence is None:
+                        break
+                    await queue.put(sentence)
+
+            async def confirm(tool, arguments):
+                nonlocal pending, confirmation
+                prompt = tool.confirm_text + CONFIRM_SUFFIX
+                if pending.strip():
+                    await queue.put(pending)
+                    pending = ""
+                current = confirmation = PendingConfirmation()
+                sent = asyncio.Event()
+                try:
+                    await send("token", rid, text=prompt)
+                    await queue.put(prompt)
+                    await queue.put(sent)
+                    await sent.wait()
+                    await send("confirm_request", rid, text=prompt)
+                    try:
+                        await asyncio.wait_for(current.spoken.wait(), CONFIRM_READY_SECONDS)
+                        current.armed_at = time.monotonic()
+                        approved, detail = await asyncio.wait_for(asyncio.shield(current.result), CONFIRM_SECONDS)
+                    except TimeoutError:
+                        approved, detail = False, "timeout"
+                finally:
+                    confirmation = None
+                await send("confirm_done", rid, approved=approved)
+                return approved, detail
+
+            def audit(tool, arguments, outcome, detail):
+                action_log.record(tool, arguments, source, outcome, detail)
+                # Kept until a reply finishes, so a turn cut off after a write still reaches the model.
+                if outcome == "executed":
+                    finished_actions.append(f"{tool} {json.dumps(arguments, ensure_ascii=False)}")
+
+            def chat(messages, **options):
+                return stream_chat(DEEPSEEK_URL, API_KEY, LLM_MODEL, messages, **options)
+
+            user_message = {"role": "user", "content": text}
+            system_message = {"role": "system", "content": build_system_prompt(
+                SYSTEM, DEFAULT_CITY, agent_tools.memories.recent(), finished_actions, agent_tools.reminders.pending())}
+            demo = default_registry.get("demo_confirm") and re.sub(r"[\W_]+", "", text) == DEMO_PHRASE
+            added = await run_turn([system_message, *history.messages(), user_message], default_registry,
+                                   demo_chat if demo else chat, on_llm_event, confirm, audit)
             mark("llm_done")
             if pending.strip():
                 await queue.put(pending)
             await queue.put(None)
             await worker
             mark("all_audio_sent")
-            history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": content}])
-            del history[:-12]
+            history.add_turn([user_message, *without_outside_results(added, default_registry)])
+            finished_actions.clear()
             await send("done", rid, tts_failed=tts_failed)
+            record_latency(timings, len(added[-1].get("content") or ""))
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -537,6 +822,7 @@ async def websocket(ws: WebSocket):
                     await worker
 
     try:
+        watcher = asyncio.create_task(reminder_watcher())
         while True:
             message = await ws.receive()
             if message["type"] == "websocket.disconnect":
@@ -569,7 +855,14 @@ async def websocket(ws: WebSocket):
             rid = data.get("request_id")
             if not isinstance(rid, int) or rid < request_id:
                 continue
-            if kind in {"interrupt", "text", "audio_start"}:
+            if kind == "confirm_ready" and confirmation and rid == request_id:
+                confirmation.spoken.set()
+            elif kind == "confirm_reply" and confirmation and rid == request_id:
+                confirmation.answer(data.get("approved") is True, "button")
+            elif kind == "announce" and rid == request_id and data.get("reminder_id") in claimed:
+                await stop()
+                task = asyncio.create_task(announce(rid, claimed.pop(data["reminder_id"])))
+            elif kind in {"interrupt", "text", "audio_start"}:
                 await stop()
                 request_id = rid
                 pcm.clear()
@@ -581,14 +874,17 @@ async def websocket(ws: WebSocket):
                     if not 1 <= len(text) <= 2000:
                         await send("error", rid, text="请输入 1～2000 字")
                     else:
-                        task = asyncio.create_task(reply(rid, text=text))
+                        source = "listen" if data.get("source") == "listen" else "text"
+                        task = asyncio.create_task(reply(rid, text=text, source=source))
             elif kind == "audio_end" and recording and rid == request_id:
                 recording = False
-                task = asyncio.create_task(reply(rid, audio=bytes(pcm)))
+                task = asyncio.create_task(reply(rid, audio=bytes(pcm), source="audio"))
                 pcm.clear()
     except (WebSocketDisconnect, json.JSONDecodeError):
         pass
     finally:
+        if watcher:
+            watcher.cancel()
         if hear_task:
             hear_task.cancel()
         await stop()

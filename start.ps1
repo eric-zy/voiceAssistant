@@ -1,7 +1,9 @@
-param([switch]$UpdateKey, [ValidateSet('balanced','smooth','stream')][string]$ClonePlayback)
+param([switch]$UpdateKey, [ValidateSet('balanced','smooth','stream')][string]$ClonePlayback, [switch]$DemoConfirm)
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 if ($PSBoundParameters.ContainsKey('ClonePlayback')) { $env:VOICE_CLONE_PLAYBACK = $ClonePlayback }
+# Set on every start, so a demo run cannot leak into the next normal one in this terminal.
+$env:VOICE_DEMO_CONFIRM = if ($DemoConfirm) { '1' } else { $null }
 $python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python)) { throw 'Please create .venv and install requirements.txt first.' }
 if ($UpdateKey -or -not $env:DEEPSEEK_API_KEY) {
@@ -18,6 +20,7 @@ if ($UpdateKey -or -not $env:DEEPSEEK_API_KEY) {
 if ($LASTEXITCODE -ne 0) { throw 'API verification failed. See the diagnostic above; the web server was not started.' }
 Write-Host 'Starting chat at http://127.0.0.1:8765 - keep this terminal open; Ctrl+C stops the server.'
 $playbackMode = if ($env:VOICE_CLONE_PLAYBACK) { $env:VOICE_CLONE_PLAYBACK } else { 'balanced' }
+if ($DemoConfirm) { Write-Host 'Demo confirmation is ON: say the test phrase to try it. Tools are listed on the page.' }
 Write-Host "Custom voice playback: $playbackMode (balanced = short first sentence, then remaining reply)."
 & $python -m uvicorn app:app --host 127.0.0.1 --port 8765 --ws-max-size 2097152
 $chatExitCode = $LASTEXITCODE
