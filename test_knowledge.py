@@ -447,8 +447,10 @@ REAL_MODEL = Path(__file__).parent / "models" / "bge-small-zh"
 
 
 @pytest.mark.skipif(not (REAL_MODEL / "onnx" / "model_int8.onnx").is_file(), reason="embedding model not downloaded")
-def test_the_real_model_links_a_rephrased_question(tmp_path):
+def test_the_real_model_links_a_rephrased_question(tmp_path, monkeypatch):
     from embedding import Embedder
+    # This pair scores about 0.65: it shows the model links meanings, below the cut that real notes needed.
+    monkeypatch.setattr("knowledge.MIN_SIMILARITY", 0.6)
     base = KnowledgeBase(tmp_path / "k", tmp_path / "i.db", Embedder(REAL_MODEL))
     write(base, "差旅.md", "市内打车凭票报销。")
     write(base, "会议.md", "周一例会讨论了预算和进度。")
@@ -473,3 +475,34 @@ def test_a_tilde_fence_counts_too():
 @pytest.mark.parametrize("line", ["9.         break", "9. break", "7.             // read done.", "3.         ..."])
 def test_line_numbered_code_without_fences_is_not_a_heading(line):
     assert heading(line) is None
+
+
+def test_hidden_folders_are_skipped(base):
+    write(base, ".obsidian/workspace.md", "报销")
+    write(base, ".trash/old.md", "报销")
+    write(base, "笔记.md", "其他")
+    assert base.search("报销") == (1, [])
+
+
+def test_question_words_do_not_count_as_search_terms():
+    from knowledge import query_tokens
+    assert query_tokens("红烧肉怎么做") == ["红烧", "烧肉", "做"]
+    assert "什么" not in query_tokens("JWT 用什么算法签名")
+
+
+def test_a_question_sharing_only_question_words_finds_nothing(base):
+    write(base, "教程.md", "怎么配置 nginx？为什么要这样做？")
+    assert base.search("红烧肉怎么样")[1] == []
+
+
+def test_obsidian_contents_and_front_matter_are_not_indexed(base):
+    write(base, "笔记.md", "---\ntags: [报销]\n---\n* [[#报销流程]]\n  - [[#年假]]\n# 正文\n内容")
+    assert base.search("报销")[1] == [] and base.search("年假")[1] == []
+    assert found(base, "内容") == ["笔记.md"]
+
+
+def test_vectors_are_off_unless_switched_on(monkeypatch):
+    monkeypatch.delenv("VOICE_KB_VECTORS", raising=False)
+    assert tools.knowledge_embedder() is None
+    monkeypatch.setenv("VOICE_KB_VECTORS", "1")
+    assert tools.knowledge_embedder() is not None

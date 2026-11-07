@@ -17,7 +17,7 @@ MAX_DOCUMENT_BYTES = 20 * 1024 * 1024
 CHUNK_CHARS = 400
 CHUNK_OVERLAP = 50
 # Bump when chunks change shape, so old indexes are rebuilt instead of mixing formats.
-INDEX_VERSION = 5
+INDEX_VERSION = 6
 SCHEMA = """CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, modified INTEGER NOT NULL, size INTEGER NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(path UNINDEXED, body UNINDEXED, tokens);
 CREATE TABLE IF NOT EXISTS vectors (chunk INTEGER PRIMARY KEY, vector BLOB NOT NULL);"""
@@ -25,9 +25,10 @@ CREATE TABLE IF NOT EXISTS vectors (chunk INTEGER PRIMARY KEY, vector BLOB NOT N
 CANDIDATES = 20
 # Reciprocal rank fusion constant from the original paper; it damps the gap between first and second place.
 RRF_K = 60
-# A vector search always returns its nearest chunks, even unrelated ones. Measured on this model:
-# related pairs scored 0.53 to 0.65, unrelated 0.35 to 0.45. Below this, a vector-only hit is dropped.
-MIN_SIMILARITY = 0.5
+# A vector search always returns its nearest chunks, even unrelated ones. On short sentences related pairs
+# scored 0.53 to 0.65 and unrelated 0.35 to 0.45, but on 198 real notes answers scored 0.50 to 0.83 while
+# unrelated questions reached 0.65. 0.75 was the best tested setting there, and still not better than words.
+MIN_SIMILARITY = 0.75
 # Filling vectors for old chunks during a question must not run past the tool's timeout.
 SEARCH_EMBED_SECONDS = 2.0
 WORDS = re.compile(r"[一-鿿]+|[A-Za-z0-9]+")
@@ -43,6 +44,21 @@ NUMBERED_HEADINGS = [
 ]
 MAX_HEADING_CHARS = 30
 CODE_PUNCTUATION = re.compile(r"[{}()\[\];=<>`]|:=|\+\+")
+# Question words appear in almost every note, so they matched 红烧肉怎么做 to technical notes.
+QUESTION_WORDS = sorted(["怎么样", "怎么办", "怎么", "为什么", "什么", "哪些", "哪个", "哪里", "哪儿", "如何", "是否", "有没有",
+                         "可以", "能不能", "一下", "请问", "告诉我", "吗", "呢", "吧", "啊"], key=len, reverse=True)
+QUESTION_PATTERN = re.compile("|".join(QUESTION_WORDS))
+# Obsidian writes a table of contents of [[#section]] links and a YAML header; both name every topic.
+OBSIDIAN_TOC = re.compile(r"^\s*[*-]\s*\[\[#.*$", re.MULTILINE)
+FRONT_MATTER = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
+
+
+def query_tokens(query):
+    return list(dict.fromkeys(tokens(QUESTION_PATTERN.sub(" ", query))))
+
+
+def strip_noise(text):
+    return OBSIDIAN_TOC.sub("", FRONT_MATTER.sub("", text.replace("\r\n", "\n")))
 
 
 def tokens(text):
@@ -196,6 +212,9 @@ class KnowledgeBase:
         self.folder.mkdir(parents=True, exist_ok=True)
         root = self.folder.resolve()
         for path in self.folder.rglob("*"):
+            # Hidden folders hold tool state (.git, .obsidian, .trash), not notes.
+            if any(part.startswith(".") for part in path.relative_to(self.folder).parts):
+                continue
             # A link out of the folder must not pull other private files into the model's reach.
             if path.suffix.lower() in SUFFIXES and path.is_file() and path.resolve().is_relative_to(root):
                 if path.stat().st_size <= size_limit(path.name):
@@ -255,7 +274,7 @@ class KnowledgeBase:
             # Encrypted or damaged. Recorded with no text, so it shows as unreadable and is not retried.
             log.warning("could not read %s", name)
             text = ""
-        for piece in chunks(text):
+        for piece in chunks(strip_noise(text)):
             connection.execute("INSERT INTO chunks (path, body, tokens) VALUES (?, ?, ?)", (name, piece, f"{title} {' '.join(tokens(piece))}"))
         connection.execute("INSERT INTO files (path, modified, size) VALUES (?, ?, ?)", (name, stat.st_mtime_ns, stat.st_size))
 
@@ -297,7 +316,7 @@ class KnowledgeBase:
     def search(self, query, limit=5, semantic=True):
         """Return (indexed file count, best excerpts) from words and, when the model is present, meaning."""
         count = self.sync()
-        terms = list(dict.fromkeys(tokens(query)))
+        terms = query_tokens(query)
         if not terms:
             return count, []
         expression = " OR ".join(f'"{term}"' for term in terms)
