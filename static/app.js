@@ -4,7 +4,7 @@ let player, playAt = 0, audioChain = Promise.resolve();
 let listener = null, replyActive = false, master = null, spokenSegments = [], reportedPlaying = '', wasPlaying = false;
 const LISTEN_HINT = '待命中，直接说话即可', PLAYING_HINT = '播报中，直接说话可打断';
 const IGNORED = {noise:'没听清，已忽略', echo:'听到的是喇叭声，已忽略', short:'太短，已忽略', early:'请等问题播完再回答'};
-const CONFIRM_HINT = '请说“确认”或“取消”，也可以点按钮';
+const CONFIRM_HINT = '请说“确定执行”或“取消”，也可以点按钮';
 let confirming = null;
 const playing = new Set();
 function status(text) { $('status').textContent = text; }
@@ -330,7 +330,7 @@ function connect() {
     if (['status','error','warning'].includes(message.type)) status(message.text);
     if (message.type === 'confirm_request') askConfirm(rid, message.text);
     if (message.type === 'confirm_done') { endConfirm(); duck(false); status(message.approved ? '已确认，正在执行…' : '已取消，操作未执行'); }
-    if (message.type === 'done' && !message.tts_failed) status('回复完成；可以继续说话或打断播报');
+    if (message.type === 'done') status(message.tts_failed ? '回复完成，但语音播报失败，请看文字' : '回复完成；可以继续说话或打断播报');
     if (message.type === 'done' || message.type === 'error') replyActive = false;
     if (message.type === 'audio' && $('tts').checked) {
       audioChain = audioChain.then(async()=> {
@@ -351,7 +351,8 @@ function connect() {
   };
 }
 function refreshHealth() { return fetch('/api/status').then(r=>r.json()).then(data=>{
-  $('health').textContent = `识别模型：${data.asr_ready?'已准备':'尚未下载，请运行 prepare_asr.py'}\nDeepSeek：${data.llm_model} · ${data.api_key_configured?'Key 已载入（不代表聊天调用成功）':'请设置 DEEPSEEK_API_KEY 后重启'}\n接口：${data.api_host || '未知'} · Key 指纹：${data.key_fingerprint || '旧版服务，请重启'}\n语音播报：${data.tts_provider || 'windows'} · ${data.tts_voice}${data.tts_provider==='edge'?' · 语速 '+data.tts_rate:''}${data.tts_provider==='cosyvoice'?' · '+({balanced:'短首句优先',stream:'流式播放',smooth:'完整回复连续播放'}[data.clone_playback] || '请重启聊天服务'):''}`;
+  $('health').textContent = `识别模型：${data.asr_ready?'已准备':'尚未下载，请运行 prepare_asr.py'}\nDeepSeek：${data.llm_model} · ${data.api_key_configured?'Key 已载入（不代表聊天调用成功）':'请设置 DEEPSEEK_API_KEY 后重启'}\n接口：${data.api_host || '未知'} · Key 指纹：${data.key_fingerprint || '旧版服务，请重启'}\n语音播报：${data.tts_provider || 'windows'} · ${data.tts_voice}${data.tts_provider==='edge'?' · 语速 '+data.tts_rate:''}${data.tts_provider==='cosyvoice'?' · '+({balanced:'短首句优先',stream:'流式播放',smooth:'完整回复连续播放'}[data.clone_playback] || '请重启聊天服务'):''}
+可用工具：${(data.tools || []).join('、') || '无'}`;
 }).catch(()=> $('health').textContent='状态检查失败'); }
 refreshHealth();
 refreshMics().catch(()=>{});

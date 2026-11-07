@@ -469,7 +469,7 @@ def test_the_prompt_carries_the_clock_and_the_default_city(monkeypatch):
     assert system.startswith(backend.SYSTEM) and "用户默认城市：苏州" in system and "当前时间：" in system
 
 
-PROMPT = "要执行演示操作吗？请说确认或取消。"
+PROMPT = "要执行演示操作吗？请说确定执行或取消。"
 
 
 @pytest.mark.parametrize("heard,action", [
@@ -480,7 +480,7 @@ def test_only_a_full_yes_approves(heard, action):
     assert backend.confirmation_action(heard, PROMPT, True)[0] == action
 
 
-@pytest.mark.parametrize("heard,reason", [("确认", "echo"), ("请说确认或取消", "echo"), ("取消", "echo"), ("演示操作", "echo"), ("", "noise")])
+@pytest.mark.parametrize("heard,reason", [("确定执行", "echo"), ("请说确定执行或取消", "echo"), ("取消", "echo"), ("演示操作", "echo"), ("", "noise")])
 def test_the_question_cannot_answer_itself_while_it_plays(heard, reason):
     assert backend.confirmation_action(heard, PROMPT, False) == ("ignored", reason)
 
@@ -490,7 +490,7 @@ def test_a_yes_before_the_question_finished_does_not_count():
 
 
 def test_the_prompt_still_in_recent_text_does_not_block_a_real_yes():
-    assert backend.confirmation_action("确认", PROMPT, True)[0] == "approve"
+    assert backend.confirmation_action("确定执行", PROMPT, True)[0] == "approve"
 
 
 def confirm_session(monkeypatch, tmp_path, script=()):
@@ -524,6 +524,7 @@ def confirm_session(monkeypatch, tmp_path, script=()):
         tool, name="risky", parameters={"type": "object", "properties": {}}, run=risky, filler=False, level="confirm", confirm_text="要执行演示操作吗？"))
     log = backend.ActionLog(tmp_path / "agent.db")
     monkeypatch.setattr(backend, "action_log", log)
+    monkeypatch.setattr(backend, "DEMO_AUDIO_DIR", tmp_path / "heard")
     monkeypatch.setattr(backend, "TurnDetector", ScriptedDetector)
     monkeypatch.setattr(ScriptedDetector, "script", list(script))
     return ran, log, requests
@@ -547,8 +548,8 @@ def next_voice(socket, event):
 
 class ConfirmTalk:
     """Open a socket, ask, and stop at the confirmation question."""
-    def __init__(self, ready=True, source="listen"):
-        self.ready, self.source = ready, source
+    def __init__(self, ready=True, source="listen", text="清空吧"):
+        self.ready, self.source, self.text = ready, source, text
 
     def __enter__(self):
         self.client = TestClient(backend.app)
@@ -556,7 +557,7 @@ class ConfirmTalk:
         self.context = self.client.websocket_connect("/ws", headers={"origin": "http://127.0.0.1:8765"})
         self.socket = self.context.__enter__()
         self.socket.send_json({"type": "listen_start"})
-        self.socket.send_json({"type": "text", "request_id": 1, "text": "清空吧", "source": self.source})
+        self.socket.send_json({"type": "text", "request_id": 1, "text": self.text, "source": self.source})
         self.before = receive_until(self.socket, "confirm_request")
         if self.ready:
             self.socket.send_json({"type": "confirm_ready", "request_id": 1})
@@ -609,7 +610,7 @@ def test_an_utterance_that_began_during_the_question_cannot_approve(monkeypatch,
 
 
 def test_echo_during_the_question_is_ignored_and_it_stays_open(monkeypatch, tmp_path):
-    monkeypatch.setattr(backend, "transcribe", lambda pcm: "请说确认或取消")
+    monkeypatch.setattr(backend, "transcribe", lambda pcm: "请说确定执行或取消")
     ran, _, _ = confirm_session(monkeypatch, tmp_path, SAID)
     with ConfirmTalk(ready=False) as socket:
         socket.send_json({"type": "playing", "text": PROMPT, "recent": PROMPT})
@@ -705,3 +706,86 @@ def test_what_was_heard_is_kept_only_in_demo_mode(monkeypatch, tmp_path, demo, e
         socket.send_bytes(b"\0\0")
         receive_until(socket, "done")
     assert sum(row["tool"] == "confirm_heard" for row in log.recent()) == expected
+
+
+def test_status_lists_the_tools_so_demo_mode_can_be_seen(monkeypatch):
+    monkeypatch.setitem(backend.default_registry.tools, "demo_confirm", backend.default_registry.get("get_weather"))
+    with TestClient(backend.app) as client:
+        assert {"get_weather", "demo_confirm"} <= set(client.get("/api/status").json()["tools"])
+
+
+def demo_session(monkeypatch, tmp_path, enabled):
+    ran, log, requests = confirm_session(monkeypatch, tmp_path)
+    if enabled:
+        monkeypatch.setitem(backend.default_registry.tools, "demo_confirm", backend.default_registry.get("risky"))
+    return ran, requests
+
+
+@pytest.mark.parametrize("text", ["测试确认", "测试确认。"])
+def test_the_demo_phrase_reaches_confirmation_without_the_model(monkeypatch, tmp_path, text):
+    ran, requests = demo_session(monkeypatch, tmp_path, True)
+    with ConfirmTalk(text=text) as socket:
+        socket.send_json({"type": "confirm_reply", "request_id": 1, "approved": True})
+        messages = receive_until(socket, "done")
+    assert ran == [True] and requests == []
+    assert "演示结束，没有改动任何内容。" in [m.get("text") for m in messages]
+
+
+def test_the_demo_phrase_means_nothing_when_the_demo_is_off(monkeypatch, tmp_path):
+    ran, requests = demo_session(monkeypatch, tmp_path, False)
+    with ConfirmTalk(text="测试确认") as socket:
+        socket.send_json({"type": "interrupt", "request_id": 2})
+    assert len(requests) == 1 and not ran
+
+
+def test_the_rules_allow_tools_that_act_as_well_as_ones_that_look_up():
+    from agent_loop import TOOL_RULES
+    assert "要求执行操作" in TOOL_RULES
+
+
+def busy_then_free(monkeypatch, busy_times):
+    calls = []
+
+    async def clone(profile, text, url):
+        calls.append(text)
+        if len(calls) <= busy_times:
+            raise backend.CloneBusy("上一条克隆合成尚未结束")
+        return b"RIFFaudio"
+    monkeypatch.setattr(backend, "synthesize_clone", clone)
+    monkeypatch.setattr(backend, "TTS_PROVIDER", "cosyvoice")
+    monkeypatch.setattr(backend.voice_store, "get", lambda profile: {})
+    return calls
+
+
+def test_a_cancelled_segment_on_the_gpu_only_delays_the_next_one(monkeypatch):
+    calls = busy_then_free(monkeypatch, 2)
+    assert asyncio.run(backend.synthesize("你好")) == b"RIFFaudio"
+    assert calls == ["你好"] * 3
+
+
+def test_a_clone_service_that_stays_busy_still_fails(monkeypatch):
+    busy_then_free(monkeypatch, 10 ** 6)
+    monkeypatch.setattr(backend, "CLONE_BUSY_WAIT_SECONDS", .01)
+    with pytest.raises(backend.CloneBusy):
+        asyncio.run(backend.synthesize("你好"))
+
+
+@pytest.mark.parametrize("demo,clips", [(True, 1), (False, 0)])
+def test_recordings_are_kept_only_in_demo_mode(monkeypatch, tmp_path, demo, clips):
+    monkeypatch.setattr(backend, "transcribe", lambda pcm: "确认")
+    confirm_session(monkeypatch, tmp_path, SAID)
+    if demo:
+        monkeypatch.setitem(backend.default_registry.tools, "demo_confirm", backend.default_registry.get("risky"))
+    with ConfirmTalk() as socket:
+        socket.send_bytes(b"\0\0")
+        receive_until(socket, "done")
+    assert len(list((tmp_path / "heard").glob("*.wav"))) == clips
+
+
+def test_only_the_newest_recordings_stay(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "DEMO_AUDIO_DIR", tmp_path)
+    monkeypatch.setattr(backend, "DEMO_AUDIO_KEPT", 2)
+    for _ in range(4):
+        backend.keep_demo_audio(b"\0\0" * 100)
+        time.sleep(1.01)
+    assert len(list(tmp_path.glob("*.wav"))) == 2

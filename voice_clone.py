@@ -92,6 +92,10 @@ class VoiceStore:
         temporary.replace(self.root / "settings.json")
 
 
+class CloneBusy(RuntimeError):
+    """The GPU is still on an earlier segment, even if the request for it was cancelled."""
+
+
 def validate_service_url(base_url):
     parsed = urlsplit(base_url)
     if parsed.scheme != "http" or parsed.hostname not in {"localhost", "127.0.0.1", "::1"} or parsed.username or parsed.password or parsed.query or parsed.fragment:
@@ -106,7 +110,7 @@ async def synthesize_clone(profile, text, base_url, *, transport=None):
                 data={"tts_text":text, "prompt_text":profile["prompt_text"]},
                 files={"prompt_wav":("reference.wav", reference, "audio/wav")}) as response:
                 if response.status_code == 429:
-                    raise RuntimeError("上一条克隆合成尚未结束，请稍后再试听；可用“检查服务”查看忙碌状态")
+                    raise CloneBusy("上一条克隆合成尚未结束，请稍后再试听；可用“检查服务”查看忙碌状态")
                 if response.status_code != 200:
                     raise RuntimeError(f"CosyVoice 合成失败（HTTP {response.status_code}），请查看克隆服务窗口")
                 audio = bytearray()

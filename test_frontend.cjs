@@ -360,3 +360,13 @@ test('interrupting hides the question and a late ready is not sent',async()=>{
   page.timers.at(-1).run();
   assert.equal(page.sent.some(message=>message.type==='confirm_ready'),false);
 });
+
+test('a reply whose speech failed still ends with a status saying so',()=>{
+  const page=confirmPage();
+  page.receive({type:'confirm_done',request_id:0,approved:true});
+  assert.match(page.get('status').textContent,/已确认/);
+  page.receive({type:'done',request_id:0,tts_failed:true});
+  assert.match(page.get('status').textContent,/语音播报失败/);
+  page.receive({type:'done',request_id:0,tts_failed:false});
+  assert.match(page.get('status').textContent,/回复完成；/);
+});

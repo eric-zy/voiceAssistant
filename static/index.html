@@ -14,7 +14,7 @@
 <div style="display:grid;gap:10px"><input id="voiceName" placeholder="音色名称，例如：我的声音" maxlength="60" aria-label="音色名称"><input id="voiceFile" type="file" accept="audio/*" aria-label="参考录音"><textarea id="voiceTranscript" rows="3" maxlength="2000" placeholder="准确填写录音说了什么，不能填写要合成的新内容" aria-label="录音对应文字" style="padding:12px;font:inherit"></textarea><button id="uploadVoice" style="justify-self:start">保存参考音色</button></div>
 </details></div>
 <div class="card" id="history" aria-live="polite"><p id="empty">点击“开始说话”，说完后会自动提交。也可以先输入文字测试。</p></div>
-<div class="card" id="confirmBox" hidden><div id="confirmText"></div><div class="controls" style="margin-top:12px"><button id="confirmYes" type="button">确认</button><button id="confirmNo" class="secondary" type="button">取消</button></div></div>
+<div class="card" id="confirmBox" hidden><div id="confirmText"></div><div class="controls" style="margin-top:12px"><button id="confirmYes" type="button">确定执行</button><button id="confirmNo" class="secondary" type="button">取消</button></div></div>
 <div class="card"><div id="status" role="status">正在连接…</div><meter id="level" min="0" max="1" value="0"></meter>
 <label class="hint">麦克风 <select id="micDevice" aria-label="麦克风" style="max-width:100%;padding:6px;font:inherit"></select></label> <button id="micTest" class="secondary" type="button">麦克风诊断</button>
 <div id="vad" class="hint"></div>
@@ -23,4 +23,4 @@
 <form id="form"><input id="text" placeholder="输入文字，先验证 DeepSeek 对话" maxlength="2000" autocomplete="off"><button id="send" disabled>发送</button></form>
 <p class="hint">首次允许麦克风权限。停顿约 0.9 秒自动提交，每次最多 30 秒。请用耳机；勾选持续监听后，说的每句话都会回答，播报时直接说话可打断，建议戴耳机。</p></div>
 <footer>录音在本地识别；识别文字及最近六轮对话发送给 DeepSeek。edge-tts 将回复文字发送给微软在线语音服务；自定义声音使用本机 CosyVoice 服务。DeepSeek API 按服务商规则计费。</footer></main>
-<script src="/static/speech.js?v=voice-first-17"></script><script src="/static/app.js?v=voice-first-17"></script><script src="/static/voices.js?v=voice-first-17"></script></html>
+<script src="/static/speech.js?v=voice-first-20"></script><script src="/static/app.js?v=voice-first-20"></script><script src="/static/voices.js?v=voice-first-20"></script></html>

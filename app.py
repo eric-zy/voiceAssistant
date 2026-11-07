@@ -11,18 +11,19 @@ import re
 import subprocess
 import tempfile
 import time
+import wave
 
 import httpx
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request, HTTPException
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
-from voice_clone import VoiceStore, synthesize_clone, stream_clone
+from voice_clone import CloneBusy, VoiceStore, synthesize_clone, stream_clone
 from turn_detector import TurnDetector, measure_speech
 from zhconv import convert as to_chinese_variant
 from fastapi.staticfiles import StaticFiles
 from api_config import normalize_key, fingerprint
-from agent_loop import build_system_prompt, run_turn
+from agent_loop import build_system_prompt, demo_chat, run_turn
 from conversation import Conversation
 from fillers import FillerCache, PHRASE as FILLER_PHRASE
 from llm_client import ToolCallStarted, stream_chat
@@ -38,6 +39,8 @@ API_KEY = normalize_key(os.getenv("DEEPSEEK_API_KEY", ""))
 DEFAULT_CITY = os.getenv("VOICE_DEFAULT_CITY", "").strip()
 fillers = FillerCache()
 action_log = ActionLog(ROOT / "data" / "agent.db")
+DEMO_AUDIO_DIR = ROOT / "data" / "heard"
+DEMO_AUDIO_KEPT = 40
 ASR_MODEL = os.getenv("VOICE_ASR_MODEL", str(ROOT / "models" / "whisper-base"))
 voice_store = VoiceStore(ROOT / "voices")
 saved_voice = voice_store.settings()
@@ -64,13 +67,17 @@ BARGE_IN_MAX_SECONDS = 8
 ASR_TIMEOUT_SECONDS = 8
 # Measured: speech, even a lone 对, stays under .4; invented text from noise is over .5.
 NO_SPEECH_LIMIT = .45
-# Whole-utterance matches only: anything misheard falls through to not doing it.
+# Whole-utterance matches only: anything misheard falls through to not doing it. The prompt asks for
+# 确定执行 because Whisper base gets it right far more often; a lone 确认 failed even on clean speech.
 CONFIRM_YES = {"确认", "确定执行"}
 CONFIRM_NO = {"取消", "不要", "算了"}
-CONFIRM_SUFFIX = "请说确认或取消。"
+CONFIRM_SUFFIX = "请说确定执行或取消。"
+DEMO_PHRASE = "测试确认"
 CONFIRM_SECONDS = 20
 CONFIRM_READY_SECONDS = 30
 PCM_BYTES_PER_SECOND = 32000
+# Cancelling a reply does not stop the segment on the GPU, which takes a few seconds at most.
+CLONE_BUSY_WAIT_SECONDS = 10
 latency_log = logging.getLogger("uvicorn.error")
 @contextlib.asynccontextmanager
 async def lifespan(application):
@@ -147,6 +154,18 @@ class PendingConfirmation:
         self.spoken.set()
 
 
+def keep_demo_audio(pcm):
+    """Keep what Whisper was given, for work/diagnose_audio.py. Demo mode only, newest clips only."""
+    DEMO_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(DEMO_AUDIO_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1000000}.wav"), "wb") as clip:
+        clip.setnchannels(1)
+        clip.setsampwidth(2)
+        clip.setframerate(16000)
+        clip.writeframes(pcm)
+    for old in sorted(DEMO_AUDIO_DIR.glob("*.wav"))[:-DEMO_AUDIO_KEPT]:
+        old.unlink()
+
+
 def transcribe(pcm: bytes) -> str:
     global asr_model
     if len(pcm) % 2 or not 6400 <= len(pcm) <= MAX_BYTES:
@@ -206,11 +225,22 @@ def split_lead(pending: str):
     return None, pending
 
 
+async def synthesize_clone_when_free(profile, text):
+    deadline = time.monotonic() + CLONE_BUSY_WAIT_SECONDS
+    while True:
+        try:
+            return await synthesize_clone(profile, text, COSYVOICE_URL)
+        except CloneBusy:
+            if time.monotonic() >= deadline:
+                raise
+            await asyncio.sleep(.25)
+
+
 async def synthesize(text: str) -> bytes:
     if TTS_PROVIDER == "cosyvoice":
         try:
             profile = voice_store.get(CLONE_ID)
-            return await synthesize_clone(profile, text, COSYVOICE_URL)
+            return await synthesize_clone_when_free(profile, text)
         except (httpx.HTTPError, OSError) as error:
             raise RuntimeError("无法连接本地 CosyVoice 服务，请先运行 ./start_cosyvoice.ps1") from error
     if TTS_PROVIDER == "windows":
@@ -293,7 +323,8 @@ async def status():
             "clone_playback": CLONE_PLAYBACK,
             "tts_rate": TTS_RATE, "tts_pitch": TTS_PITCH, "api_key_configured": bool(API_KEY),
             "key_fingerprint": fingerprint(API_KEY),
-            "api_host": urlsplit(DEEPSEEK_URL).hostname, "server_pid": os.getpid(), "voice_protocol": 4}
+            "api_host": urlsplit(DEEPSEEK_URL).hostname, "server_pid": os.getpid(), "voice_protocol": 4,
+            "tools": list(default_registry.tools)}
 
 
 def require_local_page(request):
@@ -459,6 +490,8 @@ async def websocket(ws: WebSocket):
                 continue
             if partial and not hear_queue.empty():
                 continue
+            if not partial and default_registry.get("demo_confirm"):
+                keep_demo_audio(audio)
             try:
                 heard = await asyncio.wait_for(asyncio.to_thread(transcribe, audio), ASR_TIMEOUT_SECONDS)
             except ValueError:
@@ -621,8 +654,9 @@ async def websocket(ws: WebSocket):
 
             user_message = {"role": "user", "content": text}
             system_message = {"role": "system", "content": build_system_prompt(SYSTEM, DEFAULT_CITY)}
-            added = await run_turn([system_message, *history.messages(), user_message], default_registry, chat, on_llm_event,
-                                   confirm, audit)
+            demo = default_registry.get("demo_confirm") and re.sub(r"[\W_]+", "", text) == DEMO_PHRASE
+            added = await run_turn([system_message, *history.messages(), user_message], default_registry,
+                                   demo_chat if demo else chat, on_llm_event, confirm, audit)
             mark("llm_done")
             if pending.strip():
                 await queue.put(pending)
