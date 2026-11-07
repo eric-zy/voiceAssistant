@@ -321,6 +321,14 @@ function connect() {
   ws.onmessage = event => {
     const message = JSON.parse(event.data), rid = message.request_id;
     if (message.type === 'voice') { handleVoice(message); return; }
+    // Not tied to the current turn: a write that finished stays undoable after an interruption.
+    if (message.type === 'memory_changed') { window.memoryChanged?.(message); return; }
+    // The server only sends this when idle. A new turn lets the usual reply path show and speak it.
+    if (message.type === 'reminder_due') {
+      const turn = nextTurn(); unlockAudio().catch(() => {}); replyActive = true;
+      ws.send(JSON.stringify({type:'announce', request_id:turn, reminder_id:message.reminder_id}));
+      return;
+    }
     if (rid !== requestId) return;
     if (message.type === 'transcript') bubble('user',message.text);
     if (message.type === 'token') {

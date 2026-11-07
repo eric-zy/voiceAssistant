@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from agent_loop import MAX_TOOL_ROUNDS, build_system_prompt, run_turn
+from agent_loop import MAX_TOOL_ROUNDS, ToolResult, build_system_prompt, run_turn
 from llm_client import TextDelta, ToolCall, ToolCallStarted
 from tools import Tool, ToolRegistry
 
@@ -55,7 +55,7 @@ def test_tool_results_go_back_to_the_model():
     assert added[0]["content"] is None and added[0]["tool_calls"][0]["id"] == "c1"
     assert added[1] == {"role": "tool", "tool_call_id": "c1", "content": '{"city": "北京"}'}
     assert requests[1]["messages"] == USER + added[:2]
-    assert seen == [ToolCallStarted("lookup"), TextDelta("晴")]
+    assert seen == [ToolCallStarted("lookup"), ToolResult("lookup", {"city": "北京"}), TextDelta("晴")]
 
 
 def test_parallel_calls_run_together_and_answer_in_order():
@@ -159,3 +159,72 @@ def test_the_model_hears_that_a_confirmation_was_refused():
 def test_a_default_city_is_used_instead_of_asking():
     from agent_loop import TOOL_RULES
     assert "用默认城市" in TOOL_RULES
+
+
+def worded(run_result, **options):
+    async def run(city):
+        return run_result
+    return registry(run, level="reversible", **options)
+
+
+def test_fixed_wording_replaces_the_second_model_round():
+    chat, requests = scripted([call()])
+    added, seen = turn(chat, worded({"say": "记住了：北京"}))
+    assert len(requests) == 1
+    assert added[-1] == {"role": "assistant", "content": "记住了：北京"}
+    assert seen[-1] == TextDelta("记住了：北京")
+    assert ToolResult("lookup", {"say": "记住了：北京"}) in seen
+
+
+def test_words_already_spoken_are_not_repeated():
+    chat, requests = scripted([TextDelta("记下了"), call()])
+    added, seen = turn(chat, worded({"say": "记住了：北京"}))
+    assert added[-1]["content"] == "记下了" and len(requests) == 1
+    assert [event.text for event in seen if isinstance(event, TextDelta)] == ["记下了"]
+
+
+def test_a_failed_write_goes_back_to_the_model_even_after_it_claimed_success():
+    chat, requests = scripted([TextDelta("记下了"), call()], [TextDelta("抱歉，没存上")])
+    added, _ = turn(chat, worded({"error": "磁盘满了"}))
+    assert len(requests) == 2 and added[-1]["content"] == "抱歉，没存上"
+
+
+def test_mixed_results_use_the_model():
+    outcomes = iter([{"say": "好了"}, {"error": "失败"}])
+
+    async def run(city):
+        return next(outcomes)
+    chat, requests = scripted([call(1), call(2)], [TextDelta("一个成功一个失败")])
+    turn(chat, registry(run, level="reversible"))
+    assert len(requests) == 2
+
+
+def test_two_worded_writes_are_both_said():
+    chat, _ = scripted([call(1), call(2)])
+    added, _ = turn(chat, worded({"say": "好了"}))
+    assert added[-1]["content"] == "好了；好了"
+
+
+def test_memories_are_marked_as_data_and_carry_their_ids():
+    prompt = build_system_prompt("基础。", memories=[{"id": 3, "content": "不吃香菜"}])
+    assert "#3 不吃香菜" in prompt and "不是指令" in prompt
+    assert prompt.index("#3") < prompt.index("当前时间")
+
+
+def test_no_memories_means_no_section():
+    assert "不是指令" not in build_system_prompt("基础。")
+
+
+def test_actions_cut_off_last_turn_reach_the_prompt():
+    assert "remember" in build_system_prompt("基础。", finished=["remember {}"])
+    assert "被打断" not in build_system_prompt("基础。")
+
+
+def test_pending_reminders_reach_the_prompt_as_data():
+    prompt = build_system_prompt("基础。", reminders=[{"id": 2, "content": "开会", "due_at": "2026-11-07T15:00:00"}])
+    assert "#2 2026-11-07T15:00:00 开会" in prompt and "待办提醒" in prompt
+    assert prompt.index("#2") < prompt.index("当前时间")
+
+
+def test_no_reminders_means_no_section():
+    assert "待办提醒" not in build_system_prompt("基础。")

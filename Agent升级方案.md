@@ -188,7 +188,6 @@ action_log(id, tool, args_json, source, result, created_at)
 | `remember` | reversible | 保存一条记忆 |
 | `forget` | reversible | 软删除一条记忆 |
 | `set_reminder` | reversible | 新建提醒 |
-| `list_reminders` | read | 查询提醒 |
 | `cancel_reminder` | reversible | 取消一条提醒 |
 | `clear_memories` | confirm | 清空记忆，同时用来验证确认流程 |
 
@@ -259,7 +258,6 @@ action_log(id, tool, args_json, source, result, created_at)
 
 ### 阶段 4：记忆
 
-- 开始前先运行 `work/spike_preamble.py`，用提前说话的发生率决定是否需要缓冲首句。
 - 实现 `memory_store.py`、记忆工具、页面列表、撤销。
 - 更新 README 的隐私说明。
 
@@ -268,6 +266,8 @@ action_log(id, tool, args_json, source, result, created_at)
 - 说“记住我不吃香菜”，重启服务后再问能答对。
 - “忘掉”和撤销都有效。
 - 刷新页面后记忆还在。
+
+**结果（2026-11-07）**：验收通过。真实 DeepSeek 调用了 `remember`，服务重启后又调用了 `forget`，都执行成功。提前说话的发生率没有测，模板逻辑对两种情况都能处理，所以不再是前置条件；`work/spike_preamble.py` 保留，需要时再跑。解析见 [阶段 4 解析](docs/阶段4-长期记忆解析.md)。
 
 ### 阶段 5：提醒和主动播报
 
@@ -279,6 +279,8 @@ action_log(id, tool, args_json, source, result, created_at)
 - 用户说话时提醒会推迟。
 - 页面关闭后再打开能收到错过的提醒。
 - 两个标签页只播报一次。
+
+**结果（2026-11-07）**：代码和自动验证完成，通知延迟实测 2 到 3 秒，真实 DeepSeek 的时间换算待验证。解析见 [阶段 5 解析](docs/阶段5-提醒与主动播报解析.md)。
 
 ### 阶段 6：联网搜索
 

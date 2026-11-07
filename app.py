@@ -23,11 +23,12 @@ from turn_detector import TurnDetector, measure_speech
 from zhconv import convert as to_chinese_variant
 from fastapi.staticfiles import StaticFiles
 from api_config import normalize_key, fingerprint
-from agent_loop import build_system_prompt, demo_chat, run_turn
+from agent_loop import ToolResult, build_system_prompt, demo_chat, run_turn
 from conversation import Conversation
 from fillers import FillerCache, PHRASE as FILLER_PHRASE
 from llm_client import ToolCallStarted, stream_chat
 from memory_store import ActionLog
+import tools as agent_tools
 from tools import default_registry
 from urllib.parse import urlsplit
 from windows_asyncio import disconnect_logging
@@ -78,6 +79,7 @@ CONFIRM_READY_SECONDS = 30
 PCM_BYTES_PER_SECOND = 32000
 # Cancelling a reply does not stop the segment on the GPU, which takes a few seconds at most.
 CLONE_BUSY_WAIT_SECONDS = 10
+REMINDER_POLL_SECONDS = 5
 latency_log = logging.getLogger("uvicorn.error")
 @contextlib.asynccontextmanager
 async def lifespan(application):
@@ -332,6 +334,60 @@ def require_local_page(request):
         raise HTTPException(403, "请通过本机项目页面操作")
 
 
+def require_local_host(request):
+    # Plain GETs carry no Origin. Checking Host stops another site reaching this through DNS rebinding.
+    if request.headers.get("host") not in {"127.0.0.1:8765", "localhost:8765"}:
+        raise HTTPException(403, "请通过本机项目页面操作")
+
+
+@app.get("/api/memories")
+async def list_memories(request: Request):
+    require_local_host(request)
+    return {"memories": agent_tools.memories.recent()}
+
+
+@app.delete("/api/memories/{memory_id}")
+async def delete_memory(request: Request, memory_id: int):
+    require_local_page(request)
+    if agent_tools.memories.forget(memory_id) is None:
+        raise HTTPException(404, "没有这条记忆")
+    action_log.record("forget", {"memory_id": memory_id}, "page", "executed")
+    return {"ok": True}
+
+
+@app.post("/api/memories/{memory_id}/restore")
+async def restore_memory(request: Request, memory_id: int):
+    require_local_page(request)
+    if not agent_tools.memories.restore(memory_id):
+        raise HTTPException(404, "没有可恢复的记忆")
+    action_log.record("restore", {"memory_id": memory_id}, "page", "executed")
+    return {"ok": True}
+
+
+@app.get("/api/reminders")
+async def list_reminders(request: Request):
+    require_local_host(request)
+    return {"reminders": agent_tools.reminders.pending()}
+
+
+@app.delete("/api/reminders/{reminder_id}")
+async def delete_reminder(request: Request, reminder_id: int):
+    require_local_page(request)
+    if agent_tools.reminders.cancel(reminder_id) is None:
+        raise HTTPException(404, "没有这条提醒")
+    action_log.record("cancel_reminder", {"reminder_id": reminder_id}, "page", "executed")
+    return {"ok": True}
+
+
+@app.post("/api/reminders/{reminder_id}/restore")
+async def restore_reminder(request: Request, reminder_id: int):
+    require_local_page(request)
+    if not agent_tools.reminders.restore(reminder_id):
+        raise HTTPException(404, "没有可恢复的提醒")
+    action_log.record("restore_reminder", {"reminder_id": reminder_id}, "page", "executed")
+    return {"ok": True}
+
+
 @app.get("/api/voices")
 async def voices():
     ready = False
@@ -425,7 +481,10 @@ async def websocket(ws: WebSocket):
         await ws.close(code=1008)
         return
     await ws.accept()
+    watcher = None
     history = Conversation()
+    finished_actions = []
+    claimed = {}
     task = None
     pcm = bytearray()
     recording = False
@@ -456,6 +515,36 @@ async def websocket(ws: WebSocket):
 
     def reply_active():
         return bool(playing_text) or interrupted or (task is not None and not task.done())
+
+    def can_interrupt_nobody():
+        speaking = detector is not None and getattr(detector, "audio", None) is not None
+        return not (reply_active() or recording or speaking or claimed)
+
+    async def reminder_watcher():
+        # Only an open page can speak, so a reminder stays pending until one is connected and idle.
+        while True:
+            await asyncio.sleep(REMINDER_POLL_SECONDS)
+            try:
+                if can_interrupt_nobody() and (due := agent_tools.reminders.claim_due()):
+                    claimed[due["id"]] = due
+                    await send("reminder_due", None, reminder_id=due["id"])
+            except Exception:
+                latency_log.exception("reminder check failed")
+
+    async def announce(rid, reminder):
+        text = agent_tools.reminder_speech(reminder)
+        agent_tools.reminders.mark_delivered(reminder["id"])
+        await send("token", rid, text=text)
+        failed = False
+        try:
+            async with contextlib.aclosing(synthesize_parts(text)) as parts:
+                async for audio in parts:
+                    await send_audio(rid, audio, text)
+        except Exception as error:
+            failed = True
+            reason = str(error) if isinstance(error, (ValueError, RuntimeError)) else "请检查网络及音色配置"
+            await send("warning", rid, text=f"提醒播报失败：{reason}；请看文字")
+        await send("done", rid, tts_failed=failed)
 
     async def voice(event, **data):
         await send("voice", None, event=event, **data)
@@ -592,6 +681,10 @@ async def websocket(ws: WebSocket):
 
             async def on_llm_event(event):
                 nonlocal pending, first_token, filler_played
+                if isinstance(event, ToolResult):
+                    if event.result.get("undo") or event.result.get("changed"):
+                        await send("memory_changed", rid, text=event.result.get("say", ""), undo=event.result.get("undo"))
+                    return
                 if isinstance(event, ToolCallStarted):
                     mark("tool_start")
                     tool = default_registry.get(event.name)
@@ -648,12 +741,16 @@ async def websocket(ws: WebSocket):
 
             def audit(tool, arguments, outcome, detail):
                 action_log.record(tool, arguments, source, outcome, detail)
+                # Kept until a reply finishes, so a turn cut off after a write still reaches the model.
+                if outcome == "executed":
+                    finished_actions.append(f"{tool} {json.dumps(arguments, ensure_ascii=False)}")
 
             def chat(messages, **options):
                 return stream_chat(DEEPSEEK_URL, API_KEY, LLM_MODEL, messages, **options)
 
             user_message = {"role": "user", "content": text}
-            system_message = {"role": "system", "content": build_system_prompt(SYSTEM, DEFAULT_CITY)}
+            system_message = {"role": "system", "content": build_system_prompt(
+                SYSTEM, DEFAULT_CITY, agent_tools.memories.recent(), finished_actions, agent_tools.reminders.pending())}
             demo = default_registry.get("demo_confirm") and re.sub(r"[\W_]+", "", text) == DEMO_PHRASE
             added = await run_turn([system_message, *history.messages(), user_message], default_registry,
                                    demo_chat if demo else chat, on_llm_event, confirm, audit)
@@ -664,6 +761,7 @@ async def websocket(ws: WebSocket):
             await worker
             mark("all_audio_sent")
             history.add_turn([user_message, *added])
+            finished_actions.clear()
             await send("done", rid, tts_failed=tts_failed)
         except asyncio.CancelledError:
             raise
@@ -677,6 +775,7 @@ async def websocket(ws: WebSocket):
                     await worker
 
     try:
+        watcher = asyncio.create_task(reminder_watcher())
         while True:
             message = await ws.receive()
             if message["type"] == "websocket.disconnect":
@@ -713,6 +812,9 @@ async def websocket(ws: WebSocket):
                 confirmation.spoken.set()
             elif kind == "confirm_reply" and confirmation and rid == request_id:
                 confirmation.answer(data.get("approved") is True, "button")
+            elif kind == "announce" and rid == request_id and data.get("reminder_id") in claimed:
+                await stop()
+                task = asyncio.create_task(announce(rid, claimed.pop(data["reminder_id"])))
             elif kind in {"interrupt", "text", "audio_start"}:
                 await stop()
                 request_id = rid
@@ -734,6 +836,8 @@ async def websocket(ws: WebSocket):
     except (WebSocketDisconnect, json.JSONDecodeError):
         pass
     finally:
+        if watcher:
+            watcher.cancel()
         if hear_task:
             hear_task.cancel()
         await stop()

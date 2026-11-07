@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 import json
 
 import httpx
@@ -234,3 +235,108 @@ def test_a_failed_write_is_logged_as_failed():
 def test_the_demo_tool_is_off_unless_asked_for():
     assert tools.default_registry.get("demo_confirm") is None
     assert tools.DEMO_CONFIRM.level == "confirm"
+
+
+def memory_call(name, **arguments):
+    return json.loads(asyncio.run(tools.default_registry.execute(ToolCall("c", name, json.dumps(arguments, ensure_ascii=False)))))
+
+
+def test_remember_saves_and_offers_undo(memories):
+    result = memory_call("remember", content=" 不吃香菜 ")
+    assert memories.recent()[0]["content"] == "不吃香菜"
+    assert result["say"] == "记住了：不吃香菜"
+    assert result["undo"] == {"action": "delete", "id": memories.recent()[0]["id"]}
+
+
+@pytest.mark.parametrize("content", ["", "   ", "字" * 201])
+def test_remember_refuses_empty_or_oversized_text(memories, content):
+    assert "1 到 200" in memory_call("remember", content=content)["error"]
+    assert memories.recent() == []
+
+
+def test_forget_uses_the_id_and_offers_undo(memories):
+    keep, drop = memories.add("喜欢美式"), memories.add("不吃香菜")
+    result = memory_call("forget", memory_id=str(drop))
+    assert result["say"] == "已经忘掉：不吃香菜" and result["undo"] == {"action": "restore", "id": drop}
+    assert [m["id"] for m in memories.recent()] == [keep]
+
+
+@pytest.mark.parametrize("memory_id,hint", [("abc", "编号"), ("-1", "编号"), ("999", "没有编号")])
+def test_forget_refuses_a_bad_id(memories, memory_id, hint):
+    memories.add("不吃香菜")
+    assert hint in memory_call("forget", memory_id=memory_id)["error"]
+    assert len(memories.recent()) == 1
+
+
+def test_clearing_memories_cannot_run_without_a_yes(memories):
+    memories.add("不吃香菜")
+    assert memory_call("clear_memories")["cancelled"] is True
+    assert len(memories.recent()) == 1
+
+
+def test_clearing_memories_after_a_yes(memories):
+    memories.add("不吃香菜")
+    result = json.loads(asyncio.run(tools.default_registry.execute(ToolCall("c", "clear_memories", "{}"), answer(True, "button"))))
+    assert result["say"] == "已清空全部记忆，共 1 条。" and memories.recent() == []
+
+
+def test_each_memory_tool_has_the_expected_level():
+    levels = {name: tools.default_registry.get(name).level for name in ("remember", "forget", "clear_memories")}
+    assert levels == {"remember": "reversible", "forget": "reversible", "clear_memories": "confirm"}
+
+
+FUTURE = datetime(2099, 11, 7, 15, 0, 0)
+
+
+@pytest.mark.parametrize("moment,text", [
+    (datetime(2026, 11, 7, 15, 0), "11月7日下午3点"), (datetime(2026, 11, 7, 15, 30), "11月7日下午3点30分"),
+    (datetime(2026, 1, 2, 9, 5), "1月2日上午9点5分"), (datetime(2026, 11, 7, 12, 0), "11月7日中午12点"),
+    (datetime(2026, 11, 7, 0, 30), "11月7日凌晨0点30分"), (datetime(2026, 11, 7, 21, 0), "11月7日晚上9点")])
+def test_times_are_read_back_in_full(moment, text):
+    assert tools.spoken_time(moment) == text
+
+
+def test_setting_a_reminder_reads_the_time_back_and_offers_undo(reminders):
+    result = memory_call("set_reminder", content=" 开会 ", due_at="2099-11-07T15:00:00")
+    assert result["say"] == "提醒设好了，11月7日下午3点：开会"
+    assert reminders.pending()[0]["due_at"] == "2099-11-07T15:00:00"
+    assert result["undo"] == {"kind": "reminder", "action": "delete", "id": reminders.pending()[0]["id"]}
+
+
+def test_a_past_time_goes_back_to_the_model(reminders):
+    assert "已经过去" in memory_call("set_reminder", content="开会", due_at="2020-01-01T15:00:00")["error"]
+    assert reminders.pending() == []
+
+
+@pytest.mark.parametrize("due_at", ["明天下午三点", "", "2099-13-45T00:00:00"])
+def test_a_bad_time_is_refused(reminders, due_at):
+    assert "格式" in memory_call("set_reminder", content="开会", due_at=due_at)["error"]
+    assert reminders.pending() == []
+
+
+def test_a_time_with_a_zone_becomes_local_time(reminders):
+    memory_call("set_reminder", content="开会", due_at="2099-11-07T15:00:00+00:00")
+    expected = datetime(2099, 11, 7, 15, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+    assert reminders.pending()[0]["due_at"] == expected.isoformat(timespec="seconds")
+
+
+def test_empty_reminder_text_is_refused(reminders):
+    assert "1 到 200" in memory_call("set_reminder", content="  ", due_at="2099-11-07T15:00:00")["error"]
+
+
+def test_cancelling_uses_the_id_and_offers_undo(reminders):
+    reminder_id = reminders.add("开会", FUTURE)
+    result = memory_call("cancel_reminder", reminder_id=str(reminder_id))
+    assert result["say"] == "已取消提醒：开会" and reminders.pending() == []
+    assert result["undo"] == {"kind": "reminder", "action": "restore", "id": reminder_id}
+
+
+@pytest.mark.parametrize("reminder_id,hint", [("abc", "编号"), ("999", "没有编号")])
+def test_cancelling_refuses_a_bad_id(reminders, reminder_id, hint):
+    assert hint in memory_call("cancel_reminder", reminder_id=reminder_id)["error"]
+
+
+def test_an_on_time_reminder_and_a_late_one_sound_different():
+    reminder = {"content": "开会", "due_at": "2026-11-07T15:00:00"}
+    assert tools.reminder_speech(reminder, datetime(2026, 11, 7, 15, 0, 5)) == "提醒你：开会"
+    assert tools.reminder_speech(reminder, datetime(2026, 11, 7, 18, 0)) == "你错过了一条提醒，原定11月7日下午3点：开会"

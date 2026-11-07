@@ -370,3 +370,71 @@ test('a reply whose speech failed still ends with a status saying so',()=>{
   page.receive({type:'done',request_id:0,tts_failed:false});
   assert.match(page.get('status').textContent,/回复完成；/);
 });
+
+function memoryPage(list=[]) {
+  const elements = new Map(), calls = [];
+  const get = id => {
+    if (!elements.has(id)) elements.set(id,{textContent:'',hidden:true,children:[],replaceChildren(...items){this.children=items;}});
+    return elements.get(id);
+  };
+  const create = () => ({style:{},textContent:'',append(...items){this.children=items;}});
+  const context = {$:get,document:{createElement:create},status(text){get('status').textContent=text;},console,
+    fetch:async(url,options={})=>{calls.push([options.method||'GET',url]);return {ok:true,json:async()=>({memories:list})};}};
+  context.window=context;
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/memories.js','utf8'),context);
+  return {get,context,calls};
+}
+
+test('memories are listed as plain text and an empty list shows the hint',async()=>{
+  const page=memoryPage([{id:3,content:'<b>不吃香菜</b>'}]);
+  await tick();
+  assert.equal(page.get('memoryEmpty').hidden,true);
+  assert.equal(page.get('memoryList').children[0].children[0].textContent,'<b>不吃香菜</b>');
+  const empty=memoryPage([]);
+  await tick();
+  assert.equal(empty.get('memoryEmpty').hidden,false);
+});
+
+test('a new memory offers undo, and undo deletes it then hides the bar',async()=>{
+  const page=memoryPage();
+  page.context.memoryChanged({text:'记住了：不吃香菜',undo:{action:'delete',id:3}});
+  assert.equal(page.get('undoBox').hidden,false);
+  assert.equal(page.get('undoText').textContent,'记住了：不吃香菜');
+  await page.get('undoButton').onclick();
+  assert.deepEqual(page.calls.find(call=>call[0]==='DELETE'),['DELETE','/api/memories/3']);
+  assert.equal(page.get('undoBox').hidden,true);
+});
+
+test('undoing a forget restores it',async()=>{
+  const page=memoryPage();
+  page.context.memoryChanged({text:'已经忘掉：不吃香菜',undo:{action:'restore',id:3}});
+  await page.get('undoButton').onclick();
+  assert.deepEqual(page.calls.find(call=>call[0]==='POST'),['POST','/api/memories/3/restore']);
+});
+
+test('clearing has nothing to undo',()=>{
+  const page=memoryPage();
+  page.context.memoryChanged({text:'已清空全部记忆',undo:null});
+  assert.equal(page.get('undoBox').hidden,true);
+});
+
+test('a due reminder starts a new turn and asks to announce it',()=>{
+  const page=confirmPage();
+  page.receive({type:'reminder_due',request_id:null,reminder_id:7});
+  assert.deepEqual(page.sent.slice(-2),[{type:'interrupt',request_id:1},{type:'announce',request_id:1,reminder_id:7}]);
+});
+
+test('reminders are listed with their time and can be cancelled then restored',async()=>{
+  const page=memoryPage();
+  page.context.fetch=async(url,options={})=>{page.calls.push([options.method||'GET',url]);
+    return {ok:true,json:async()=>url==='/api/reminders'?{reminders:[{id:2,content:'开会',due_at:'2026-11-07T15:00:00'}]}:{memories:[]}};};
+  await page.context.refreshReminders();
+  assert.equal(page.get('reminderEmpty').hidden,true);
+  const row=page.get('reminderList').children[0];
+  assert.equal(row.children[0].textContent,'2026-11-07 15:00:00 开会');
+  await row.children[1].onclick();
+  assert.deepEqual(page.calls.find(call=>call[0]==='DELETE'),['DELETE','/api/reminders/2']);
+  await page.get('undoButton').onclick();
+  assert.deepEqual(page.calls.find(call=>call[0]==='POST'),['POST','/api/reminders/2/restore']);
+});

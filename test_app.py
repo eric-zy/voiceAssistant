@@ -1,4 +1,5 @@
 import dataclasses
+from datetime import datetime, timedelta
 import asyncio
 import threading
 from types import SimpleNamespace
@@ -789,3 +790,281 @@ def test_only_the_newest_recordings_stay(monkeypatch, tmp_path):
         backend.keep_demo_audio(b"\0\0" * 100)
         time.sleep(1.01)
     assert len(list(tmp_path.glob("*.wav"))) == 2
+
+
+def memory_llm(monkeypatch, tmp_path, call_name="remember", arguments='{"content":"不吃香菜"}', slow_tool=False):
+    """Fake DeepSeek that always asks for one memory tool, unless the user is chatting."""
+    import httpx, json
+    requests = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        if "聊天" in body["messages"][-1]["content"]:
+            return httpx.Response(200, text='data: {"choices":[{"delta":{"content":"聊聊吧。"}}]}\n\ndata: [DONE]\n\n')
+        call = {"index": 0, "id": "c1", "type": "function", "function": {"name": call_name, "arguments": arguments}}
+        return httpx.Response(200, text='data: ' + json.dumps({"choices": [{"delta": {"tool_calls": [call]}, "finish_reason": "tool_calls"}]}) + '\n\ndata: [DONE]\n\n')
+    original = httpx.AsyncClient
+    monkeypatch.setattr(backend.httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr(backend, "API_KEY", "test-key")
+    monkeypatch.setattr(backend, "TTS_PROVIDER", "edge")
+    monkeypatch.setattr(backend, "action_log", backend.ActionLog(tmp_path / "actions.db"))
+
+    async def fake_synthesize(text):
+        return b"fake-wav"
+    monkeypatch.setattr(backend, "synthesize", fake_synthesize)
+    return requests
+
+
+def talk(socket, rid, text):
+    socket.send_json({"type": "text", "request_id": rid, "text": text})
+    return receive_until(socket, "done")
+
+
+def open_socket(client):
+    return client.websocket_connect("/ws", headers={"origin": "http://127.0.0.1:8765"})
+
+
+def test_remembering_speaks_fixed_words_and_later_turns_can_use_it(monkeypatch, tmp_path, memories):
+    requests = memory_llm(monkeypatch, tmp_path)
+    with TestClient(backend.app) as client, open_socket(client) as socket:
+        first = talk(socket, 1, "记住我不吃香菜")
+        talk(socket, 2, "聊天")
+    assert len(requests) == 2  # one per turn: the fixed wording needs no second round
+    assert [m["text"] for m in first if m["type"] == "audio"] == ["记住了：不吃香菜"]
+    changed = next(m for m in first if m["type"] == "memory_changed")
+    assert changed["undo"] == {"action": "delete", "id": memories.recent()[0]["id"]}
+    assert f"#{memories.recent()[0]['id']} 不吃香菜" in requests[1]["messages"][0]["content"]
+
+
+def test_a_memory_survives_a_new_connection(monkeypatch, tmp_path, memories):
+    requests = memory_llm(monkeypatch, tmp_path)
+    memories.add("喜欢美式")
+    with TestClient(backend.app) as client, open_socket(client) as socket:
+        talk(socket, 1, "聊天")
+    assert "喜欢美式" in requests[0]["messages"][0]["content"]
+
+
+def test_the_write_is_logged_with_its_source(monkeypatch, tmp_path):
+    memory_llm(monkeypatch, tmp_path)
+    with TestClient(backend.app) as client, open_socket(client) as socket:
+        talk(socket, 1, "记住")
+    assert backend.action_log.recent()[0] == {"tool": "remember", "arguments": {"content": "不吃香菜"}, "source": "text", "outcome": "executed", "detail": ""}
+
+
+def test_clearing_needs_a_yes_and_tells_the_page(monkeypatch, tmp_path, memories):
+    memory_llm(monkeypatch, tmp_path, "clear_memories", "{}")
+    memories.add("不吃香菜")
+    with TestClient(backend.app) as client, open_socket(client) as socket:
+        socket.send_json({"type": "text", "request_id": 1, "text": "清空"})
+        before = receive_until(socket, "confirm_request")
+        assert memories.recent() and "无法恢复" in before[-1]["text"]
+        socket.send_json({"type": "confirm_reply", "request_id": 1, "approved": True})
+        messages = receive_until(socket, "done")
+    assert memories.recent() == []
+    changed = next(m for m in messages if m["type"] == "memory_changed")
+    assert changed["undo"] is None and "已清空" in changed["text"]
+
+
+def test_a_write_cut_off_by_interruption_is_told_to_the_next_turn(monkeypatch, tmp_path, memories):
+    requests = memory_llm(monkeypatch, tmp_path)
+    release = threading.Event()
+
+    async def slow_speech(text):
+        await asyncio.to_thread(release.wait, 5)
+        return b"fake-wav"
+    with TestClient(backend.app) as client, open_socket(client) as socket:
+        monkeypatch.setattr(backend, "synthesize", slow_speech)
+        socket.send_json({"type": "text", "request_id": 1, "text": "记住"})
+        receive_until(socket, "memory_changed")
+        socket.send_json({"type": "interrupt", "request_id": 2})
+        release.set()
+        talk(socket, 3, "聊天")
+        talk(socket, 4, "聊天")
+    assert "被打断前" in requests[1]["messages"][0]["content"] and "remember" in requests[1]["messages"][0]["content"]
+    assert "被打断前" not in requests[2]["messages"][0]["content"]
+
+
+LOCAL = {"origin": "http://127.0.0.1:8765", "host": "127.0.0.1:8765"}
+
+
+def test_the_page_can_list_delete_and_restore(memories):
+    memory_id = memories.add("不吃香菜")
+    with TestClient(backend.app) as client:
+        assert client.get("/api/memories", headers=LOCAL).json()["memories"][0]["content"] == "不吃香菜"
+        assert client.delete(f"/api/memories/{memory_id}", headers=LOCAL).status_code == 200
+        assert memories.recent() == []
+        assert client.post(f"/api/memories/{memory_id}/restore", headers=LOCAL).status_code == 200
+    assert len(memories.recent()) == 1
+
+
+def test_changing_a_missing_memory_is_a_404(memories):
+    with TestClient(backend.app) as client:
+        assert client.delete("/api/memories/999", headers=LOCAL).status_code == 404
+        assert client.post("/api/memories/999/restore", headers=LOCAL).status_code == 404
+
+
+def test_other_sites_cannot_read_or_change_memories(memories):
+    memory_id = memories.add("不吃香菜")
+    foreign = {"origin": "https://example.com", "host": "evil.example.com"}
+    with TestClient(backend.app) as client:
+        assert client.get("/api/memories", headers=foreign).status_code == 403
+        assert client.delete(f"/api/memories/{memory_id}", headers=foreign).status_code == 403
+        assert client.post(f"/api/memories/{memory_id}/restore", headers=foreign).status_code == 403
+    assert len(memories.recent()) == 1
+
+
+def reminder_session(monkeypatch, tmp_path, script=()):
+    requests = memory_llm(monkeypatch, tmp_path)
+    monkeypatch.setattr(backend, "REMINDER_POLL_SECONDS", .02)
+    monkeypatch.setattr(backend, "TurnDetector", ScriptedDetector)
+    monkeypatch.setattr(ScriptedDetector, "script", list(script))
+    return requests
+
+
+def due_now(reminders, content="开会", seconds_ago=1):
+    return reminders.add(content, datetime.now() - timedelta(seconds=seconds_ago))
+
+
+def wait_for_due(socket):
+    while True:
+        message = socket.receive_json()
+        if message["type"] == "reminder_due":
+            return message
+
+
+def play_reminder(socket, rid, reminder_id):
+    socket.send_json({"type": "interrupt", "request_id": rid})
+    socket.send_json({"type": "announce", "request_id": rid, "reminder_id": reminder_id})
+    return receive_until(socket, "done")
+
+
+def test_a_due_reminder_is_spoken_and_delivered_once(monkeypatch, tmp_path, reminders):
+    reminder_session(monkeypatch, tmp_path)
+    reminder_id = due_now(reminders)
+    with TestClient(backend.app) as client, open_socket(client) as socket:
+        due = wait_for_due(socket)
+        messages = play_reminder(socket, 1, due["reminder_id"])
+    assert due["reminder_id"] == reminder_id
+    assert [m["text"] for m in messages if m["type"] == "audio"] == ["提醒你：开会"]
+    assert "提醒你：开会" in [m.get("text") for m in messages if m["type"] == "token"]
+    assert reminders.pending() == []
+
+
+def test_a_missed_reminder_says_it_is_late(monkeypatch, tmp_path, reminders):
+    reminder_session(monkeypatch, tmp_path)
+    due_now(reminders, seconds_ago=3600)
+    with TestClient(backend.app) as client, open_socket(client) as socket:
+        messages = play_reminder(socket, 1, wait_for_due(socket)["reminder_id"])
+    assert any("你错过了一条提醒" in m.get("text", "") for m in messages if m["type"] == "token")
+
+
+def test_two_pages_cannot_both_get_a_reminder(monkeypatch, tmp_path, reminders):
+    reminder_session(monkeypatch, tmp_path)
+    due_now(reminders)
+    with TestClient(backend.app) as client, open_socket(client) as first, open_socket(client) as second:
+        winner = wait_for_due(first)
+        time.sleep(.2)
+        second.send_json({"type": "text", "request_id": 1, "text": "聊天"})
+        messages = receive_until(second, "done")
+    assert winner and not any(m["type"] == "reminder_due" for m in messages)
+
+
+def test_a_reminder_waits_while_a_reply_is_running(monkeypatch, tmp_path, reminders):
+    reminder_session(monkeypatch, tmp_path)
+    release = threading.Event()
+
+    async def slow_speech(text):
+        await asyncio.to_thread(release.wait, 5)
+        return b"fake-wav"
+    with TestClient(backend.app) as client, open_socket(client) as socket:
+        monkeypatch.setattr(backend, "synthesize", slow_speech)
+        socket.send_json({"type": "text", "request_id": 1, "text": "聊天"})
+        receive_until(socket, "token")
+        due_now(reminders)
+        time.sleep(.2)
+        assert len(reminders.pending()) == 1 and reminders.claim_due(datetime.now() - timedelta(hours=1)) is None
+        release.set()
+        messages = receive_until(socket, "done")
+        assert not any(m["type"] == "reminder_due" for m in messages)
+        assert wait_for_due(socket)
+
+
+def test_a_reminder_waits_while_the_page_is_still_playing(monkeypatch, tmp_path, reminders):
+    reminder_session(monkeypatch, tmp_path)
+    with TestClient(backend.app) as client, open_socket(client) as socket:
+        socket.send_json({"type": "playing", "text": SPOKEN, "recent": SPOKEN})
+        time.sleep(.05)
+        due_now(reminders)
+        time.sleep(.2)
+        socket.send_json({"type": "playing", "text": "", "recent": ""})
+        assert wait_for_due(socket)
+
+
+def test_a_reminder_waits_while_someone_is_speaking(monkeypatch, tmp_path, reminders):
+    reminder_session(monkeypatch, tmp_path)
+
+    class Speaking(ScriptedDetector):
+        audio = bytearray(b"speech")
+    monkeypatch.setattr(backend, "TurnDetector", Speaking)
+    with TestClient(backend.app) as client, open_socket(client) as socket:
+        socket.send_json({"type": "listen_start"})
+        time.sleep(.05)
+        due_now(reminders)
+        time.sleep(.2)
+        Speaking.audio = None
+        try:
+            assert wait_for_due(socket)
+        finally:
+            Speaking.audio = bytearray(b"speech")
+
+
+def test_a_page_cannot_announce_what_it_did_not_claim(monkeypatch, tmp_path, reminders):
+    reminder_session(monkeypatch, tmp_path)
+    reminder_id = reminders.add("开会", datetime(2099, 1, 1))
+    with TestClient(backend.app) as client, open_socket(client) as socket:
+        socket.send_json({"type": "interrupt", "request_id": 1})
+        socket.send_json({"type": "announce", "request_id": 1, "reminder_id": reminder_id})
+        messages = talk(socket, 2, "聊天")
+    assert not any("提醒你" in m.get("text", "") for m in messages) and len(reminders.pending()) == 1
+
+
+def test_failed_speech_still_delivers_the_words(monkeypatch, tmp_path, reminders):
+    reminder_session(monkeypatch, tmp_path)
+    due_now(reminders)
+
+    async def broken(text):
+        raise RuntimeError("voice unavailable")
+    monkeypatch.setattr(backend, "synthesize", broken)
+    with TestClient(backend.app) as client, open_socket(client) as socket:
+        messages = play_reminder(socket, 1, wait_for_due(socket)["reminder_id"])
+    assert messages[-1]["tts_failed"] is True and any(m["type"] == "warning" for m in messages)
+    assert reminders.pending() == []
+
+
+def test_pending_reminders_reach_the_model(monkeypatch, tmp_path, reminders):
+    requests = memory_llm(monkeypatch, tmp_path)
+    reminders.add("开会", datetime(2099, 1, 1))
+    with TestClient(backend.app) as client, open_socket(client) as socket:
+        talk(socket, 1, "聊天")
+    assert "开会" in requests[0]["messages"][0]["content"]
+
+
+def test_the_page_can_list_cancel_and_restore_reminders(reminders):
+    reminder_id = reminders.add("开会", datetime(2099, 1, 1))
+    with TestClient(backend.app) as client:
+        assert client.get("/api/reminders", headers=LOCAL).json()["reminders"][0]["content"] == "开会"
+        assert client.delete(f"/api/reminders/{reminder_id}", headers=LOCAL).status_code == 200
+        assert reminders.pending() == []
+        assert client.post(f"/api/reminders/{reminder_id}/restore", headers=LOCAL).status_code == 200
+        assert client.delete("/api/reminders/999", headers=LOCAL).status_code == 404
+    assert len(reminders.pending()) == 1
+
+
+def test_other_sites_cannot_read_or_change_reminders(reminders):
+    reminder_id = reminders.add("开会", datetime(2099, 1, 1))
+    foreign = {"origin": "https://example.com", "host": "evil.example.com"}
+    with TestClient(backend.app) as client:
+        assert client.get("/api/reminders", headers=foreign).status_code == 403
+        assert client.delete(f"/api/reminders/{reminder_id}", headers=foreign).status_code == 403
+    assert len(reminders.pending()) == 1
