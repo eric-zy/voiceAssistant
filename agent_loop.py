@@ -8,7 +8,7 @@ from tools import no_audit
 
 MAX_TOOL_ROUNDS = 3
 TOOL_RULES = ("需要实时信息或用户要求执行操作时调用工具，闲聊和常识问题直接回答。调用工具之前不要说话，也不要声称已经完成。"
-              "查天气时用户没说地点就先问，温度读成口语，不要逐项罗列。")
+              "查天气时用户没说地点就用默认城市，没有默认城市才问，温度读成口语，不要逐项罗列。")
 
 
 def build_system_prompt(base, default_city=""):

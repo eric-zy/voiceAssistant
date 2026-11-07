@@ -6,10 +6,10 @@
 
 助手现在可以查询天气：问“北京明天下雨吗”，模型会调用 `get_weather`，查到后用口语回答。闲聊和常识问题不调用工具。
 
-天气数据来自 Open-Meteo，无需 Key；查询的地点会发给该服务。设置 `VOICE_DEFAULT_CITY` 后，不说地点时默认查这个城市，否则助手会先问你：
+天气数据来自 Open-Meteo，无需 Key；查询的地点会发给该服务。不说地点时默认查合肥。要换城市，启动前设置 `VOICE_DEFAULT_CITY`；设为空字符串时，助手会先问你在哪：
 
 ```powershell
-$env:VOICE_DEFAULT_CITY = '合肥'
+$env:VOICE_DEFAULT_CITY = '苏州'
 ./start.ps1
 ```
 

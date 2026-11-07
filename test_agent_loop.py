@@ -154,3 +154,8 @@ def test_the_model_hears_that_a_confirmation_was_refused():
     chat, _ = scripted([call()], [TextDelta("已取消")])
     added = asyncio.run(run_turn(USER, registry(level="confirm", confirm_text="要执行吗？"), chat, _noop, confirm))
     assert json.loads(added[1]["content"])["cancelled"] is True and added[-1]["content"] == "已取消"
+
+
+def test_a_default_city_is_used_instead_of_asking():
+    from agent_loop import TOOL_RULES
+    assert "用默认城市" in TOOL_RULES
