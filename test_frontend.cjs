@@ -130,12 +130,13 @@ function listenerPage() {
   const context = {document:{getElementById:get,createElement:()=>({append(){}})},location:{host:'127.0.0.1:8765'},
     AudioContext:function(){return player},atob,Uint8Array,Float32Array,ArrayBuffer,DataView,JSON,Math,console,navigator:{},
     fetch:async()=>({json:async()=>({})}),WebSocket:function(){context.socket=this;this.readyState=1;this.send=item=>sent.push(item)},
-    setTimeout(){}};
+    setTimeout(){}, performance:{now:()=>Date.now()}};
   context.window=context;
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(__dirname+'/static/speech.js','utf8'),context);
   vm.runInContext(fs.readFileSync(__dirname+'/static/app.js','utf8'),context);
-  vm.runInContext(`listener={context:{sampleRate:16000,close(){}},node:{port:{}},stream:{getTracks:()=>[]}};
+  vm.runInContext(`listener={context:{sampleRate:16000,close(){}},node:{port:{}},stream:{getTracks:()=>[]},
+      gate:newSpeechGate(), uplink:{codec:'pcm', send:pcm=>ws.send(pcm), close(){}}};
     this.unlock=unlockAudio;
     this.frame=()=>listen(new Float32Array(1600).fill(.05));
     this.play=text=>{spokenSegments=[{start:99,end:105,text}]};
@@ -480,4 +481,64 @@ test('a refused upload shows why',async()=>{
   const page=libraryPage([],[{ok:false,json:async()=>({detail:'只支持 md、txt、pdf、docx 文件'})}]);
   await page.get('knowledgeFile').onchange({target:{files:[{name:'a.exe'}],value:'x'}});
   assert.match(page.get('status').textContent,/只支持/);
+});
+
+function speechHelpers() {
+  const context = {Math, Infinity};
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/speech.js','utf8'), context);
+  return context;
+}
+const QUIET = 0.0003, LOUD = 0.2, CHUNK_MS = 40;
+function feed(gate, helpers, levels, start = 0, keepOpen = false) {
+  return levels.map((rms, index) => helpers.gateChunk(gate, `c${start + index}`, rms, (start + index) * CHUNK_MS, CHUNK_MS, keepOpen));
+}
+
+test('silence never leaves the browser', () => {
+  const helpers = speechHelpers(), gate = helpers.newSpeechGate();
+  const results = feed(gate, helpers, Array(100).fill(QUIET));
+  assert.equal(results.every(r => r.send.length === 0 && !r.gap), true);
+});
+
+test('speech is sent with the moments just before it, so the first syllable survives', () => {
+  const helpers = speechHelpers(), gate = helpers.newSpeechGate();
+  feed(gate, helpers, Array(30).fill(QUIET));
+  const [first] = feed(gate, helpers, [LOUD], 30);
+  assert.deepEqual([...first.send], ['c20', 'c21', 'c22', 'c23', 'c24', 'c25', 'c26', 'c27', 'c28', 'c29', 'c30']);
+});
+
+test('the gate stays open long enough for the server to see the sentence end, then closes once', () => {
+  const helpers = speechHelpers(), gate = helpers.newSpeechGate();
+  feed(gate, helpers, [LOUD]);
+  const after = feed(gate, helpers, Array(60).fill(QUIET), 1);
+  const sentUntil = after.findIndex(r => r.send.length === 0);
+  assert.ok(sentUntil * CHUNK_MS >= 1000, `only ${sentUntil * CHUNK_MS} ms of trailing silence was sent`);
+  assert.equal(after.filter(r => r.gap).length, 1);
+  assert.equal(after[sentUntil].gap, true);
+});
+
+test('while a reply plays everything is sent, so talking over it can interrupt', () => {
+  const helpers = speechHelpers(), gate = helpers.newSpeechGate();
+  const results = feed(gate, helpers, Array(80).fill(QUIET), 0, true);
+  assert.equal(results.every(r => r.send.length > 0), true);
+});
+
+test('pre-roll is bounded, however long the silence', () => {
+  const helpers = speechHelpers(), gate = helpers.newSpeechGate();
+  feed(gate, helpers, Array(1000).fill(QUIET));
+  assert.ok(gate.buffer.length <= 11);
+});
+
+test('a quiet room sends nothing while listening', () => {
+  const page = listenerPage();
+  vm.runInContext('this.quiet=()=>listen(new Float32Array(1600).fill(0.0001))', page.context);
+  for (let i = 0; i < 20; i++) page.context.quiet();
+  assert.equal(page.sent.filter(item => typeof item !== 'string').length, 0);
+});
+
+test('the page announces whether it can play Ogg/Opus when it connects', () => {
+  const page = listenerPage();
+  page.context.Audio = function(){ this.canPlayType = () => 'probably'; };
+  page.context.socket.onopen();
+  assert.deepEqual(page.messages().find(m => m.type === 'client'), {type:'client', audio:['ogg-opus']});
 });

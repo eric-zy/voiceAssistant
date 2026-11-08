@@ -152,10 +152,39 @@ function handleVoice({event, text, reason, chance}) {
   }
 }
 function listen(chunk) {
-  $('level').value = meterLevel(chunkRms(chunk));
+  const rms = chunkRms(chunk);
+  $('level').value = meterLevel(rms);
   if (recording) return;
   reportPlaying();
-  ws.send(toPCM([chunk], listener.context.sampleRate));
+  const rate = listener.context.sampleRate;
+  const {send, gap} = gateChunk(listener.gate, chunk, rms, performance.now(), chunk.length / rate * 1000, assistantSpeaking());
+  for (const piece of send) listener.uplink.send(toPCM([piece], rate));
+  if (gap && ws.readyState === 1) ws.send(JSON.stringify({type:'listen_gap'}));
+}
+// Opus through WebCodecs where the browser has it, about an eighth of raw PCM; plain PCM otherwise.
+async function createUplink() {
+  const config = {codec:'opus', sampleRate:16000, numberOfChannels:1, bitrate:24000};
+  const supported = typeof AudioEncoder !== 'undefined' && (await AudioEncoder.isConfigSupported(config).catch(() => ({}))).supported;
+  if (!supported) return {codec:'pcm', send: pcm => { if (ws.readyState === 1) ws.send(pcm); }, close() {}};
+  let samplesSent = 0;
+  const encoder = new AudioEncoder({
+    output: chunk => {
+      const packet = new Uint8Array(chunk.byteLength); chunk.copyTo(packet);
+      if (ws.readyState === 1) ws.send(packet);
+    },
+    error: error => status('麦克风编码失败：' + error.message)});
+  encoder.configure(config);
+  return {codec:'opus', close: () => { try { encoder.close(); } catch {} }, send: pcm => {
+    const samples = new Int16Array(pcm);
+    if (!samples.length || encoder.state !== 'configured') return;
+    encoder.encode(new AudioData({format:'s16', sampleRate:16000, numberOfFrames:samples.length, numberOfChannels:1,
+      timestamp: samplesSent * 1e6 / 16000, data:samples}));
+    samplesSent += samples.length;
+  }};
+}
+// Whether this browser can decode Ogg/Opus replies; the server sends WAV to any that cannot.
+function canPlayOggOpus() {
+  try { return new Audio().canPlayType('audio/ogg; codecs="opus"') !== ''; } catch { return false; }
 }
 const MIC_MODES = [
   {label:'降噪+增益', noiseSuppression:true, autoGainControl:true},
@@ -189,8 +218,11 @@ async function startListening() {
   await unlockAudio();
   const mic = await openMic($('micDevice').value, savedMicMode());
   if (!$('listen').checked) { closeMic(mic); return; }
+  mic.gate = newSpeechGate();
+  mic.uplink = await createUplink();
+  if (!$('listen').checked) { mic.uplink.close(); closeMic(mic); return; }
   listener = mic;
-  ws.send(JSON.stringify({type:'listen_start'}));
+  ws.send(JSON.stringify({type:'listen_start', codec:mic.uplink.codec}));
   mic.node.port.onmessage = event => { if (listener?.node === mic.node) listen(event.data); };
   refreshMics().catch(()=>{});
   status(LISTEN_HINT);
@@ -239,7 +271,7 @@ async function testMicrophones() {
 // A page newer than a still-running server would be disconnected by the first utterance.
 async function enableListening() {
   const service = await fetch('/api/status').then(response => response.json());
-  if (service.voice_protocol !== 4) throw Error('聊天服务还是旧版本，请在运行 start.ps1 的窗口按 Ctrl+C 后重新启动');
+  if (service.voice_protocol !== 5) throw Error('聊天服务还是旧版本，请在运行 start.ps1 的窗口按 Ctrl+C 后重新启动');
   if (ws.readyState !== 1) throw Error('尚未连接聊天服务，请稍候重试');
   await startListening();
 }
@@ -248,7 +280,7 @@ function stopListening() {
   if (!active) return;
   if (ws.readyState === 1) ws.send(JSON.stringify({type:'listen_stop'}));
   player?.resume(); duck(false); reportedPlaying = ''; wasPlaying = false;
-  closeMic(active); $('level').value = 0; $('vad').textContent = '';
+  active.uplink?.close(); closeMic(active); $('level').value = 0; $('vad').textContent = '';
 }
 $('mic').onclick = async () => {
   if (recording) { finishRecording(); return; }
@@ -311,7 +343,10 @@ $('form').onsubmit = async event => {
 };
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = () => { status('已连接，可以开始'); for(const id of ['mic','stop','send']) $(id).disabled=false; };
+  ws.onopen = () => {
+    ws.send(JSON.stringify({type:'client', audio: canPlayOggOpus() ? ['ogg-opus'] : []}));
+    status('已连接，可以开始'); for(const id of ['mic','stop','send']) $(id).disabled=false;
+  };
   ws.onclose = event => {
     // 4401: the session is gone, so reconnecting would only fail again; show the sign-in page instead.
     if (event?.code === 4401) { location.replace('/'); return; }

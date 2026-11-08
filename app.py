@@ -29,6 +29,7 @@ from knowledge import MAX_DOCUMENT_BYTES
 from fillers import FillerCache, PHRASE as FILLER_PHRASE
 from llm_client import ToolCallStarted, stream_chat
 from accounts import AccountStore
+from audio_codec import OpusDecoder, to_ogg_opus
 from memory_store import ActionLog  # noqa: F401  (tests build per-user logs through app)
 import tools as agent_tools
 from tools import default_registry
@@ -511,7 +512,7 @@ async def status(request: Request):
     return {"asr_ready": asr_ready, "asr_provider": ASR_PROVIDER, "llm_model": LLM_MODEL,
             "tts_voice": display_voice, "tts_provider": choice.provider, "clone_playback": CLONE_PLAYBACK,
             "tts_rate": TTS_RATE, "tts_pitch": TTS_PITCH, "api_key_configured": bool(API_KEY),
-            "voice_protocol": 4, "tools": list(default_registry.tools), "default_city": current_city(),
+            "voice_protocol": 5, "tools": list(default_registry.tools), "default_city": current_city(),
             "email": context.email, **server}
 
 
@@ -720,6 +721,9 @@ async def websocket(ws: WebSocket):
     # Everything this socket starts, replies, reminders and tools alike, inherits this user.
     user_context.CURRENT.set(context)
     watcher = None
+    # Set by the page: Opus microphone packets in, and whether it can play Ogg/Opus replies.
+    decoder = None
+    downlink_ogg = False
     history = Conversation()
     finished_actions = []
     claimed = {}
@@ -740,8 +744,14 @@ async def websocket(ws: WebSocket):
             await ws.send_json({"type": kind, "request_id": rid, **data})
 
     async def send_audio(rid, audio, text):
-        await send("audio", rid, data=base64.b64encode(audio).decode("ascii"),
-                   mime="audio/wav" if audio.startswith(b"RIFF") else "audio/mpeg", text=text)
+        mime = "audio/wav" if audio.startswith(b"RIFF") else "audio/mpeg"
+        # A cloned reply is WAV, about ten times the size of the same speech in Ogg/Opus.
+        if mime == "audio/wav" and downlink_ogg:
+            try:
+                audio, mime = await asyncio.to_thread(to_ogg_opus, audio), "audio/ogg"
+            except Exception:
+                latency_log.exception("could not compress a reply to Opus; sending WAV")
+        await send("audio", rid, data=base64.b64encode(audio).decode("ascii"), mime=mime, text=text)
 
     async def stop():
         nonlocal task
@@ -1031,7 +1041,8 @@ async def websocket(ws: WebSocket):
                 if detector is not None and not recording:
                     # Leaked playback may never fall silent, so give up on it sooner.
                     detector.max_seconds = BARGE_IN_MAX_SECONDS if playing_text else TurnDetector.MAX_SECONDS
-                    for event, audio in detector.feed(message["bytes"]):
+                    audio_in = decoder.decode(message["bytes"]) if decoder else message["bytes"]
+                    for event, audio in detector.feed(audio_in):
                         await on_turn(event, audio)
                     continue
                 if not recording or len(pcm) + len(message["bytes"]) > MAX_BYTES:
@@ -1041,12 +1052,23 @@ async def websocket(ws: WebSocket):
                 continue
             data = json.loads(message.get("text", "{}"))
             kind = data.get("type")
+            if kind == "client":
+                downlink_ogg = "ogg-opus" in (data.get("audio") or [])
+                continue
             if kind == "listen_start":
                 detector = await asyncio.to_thread(TurnDetector)
+                decoder = OpusDecoder() if data.get("codec") == "opus" else None
                 hear_task = hear_task or asyncio.create_task(hear_worker())
+                continue
+            if kind == "listen_gap":
+                # The page went quiet and stopped sending. Drop stale pre-roll so the next sentence does not
+                # start with audio from before the silence; never cut off a sentence still in progress.
+                if detector is not None and getattr(detector, "audio", None) is None:
+                    detector.reset()
                 continue
             if kind == "listen_stop":
                 detector = None
+                decoder = None
                 paused = interrupted = False
                 continue
             if kind == "playing":
