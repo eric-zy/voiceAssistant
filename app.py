@@ -33,6 +33,7 @@ from audio_codec import OpusDecoder, to_ogg_opus
 from memory_store import ActionLog  # noqa: F401  (tests build per-user logs through app)
 import tools as agent_tools
 from tools import default_registry
+import usage
 import user_context
 from urllib.parse import urlsplit
 from windows_asyncio import disconnect_logging
@@ -478,6 +479,19 @@ async def logout(request: Request):
 async def me(request: Request):
     context = require_user(request)
     return {"email": context.email, "is_admin": context.is_admin}
+
+
+@app.get("/api/usage")
+async def spend(request: Request):
+    """The signed-in user's own spend; an admin also sees every account's share of this month."""
+    context = require_user(request)
+    result = await asyncio.to_thread(usage.LEDGER.summary, context.user_id)
+    if context.is_admin:
+        everyone = await asyncio.to_thread(usage.LEDGER.summary, None)
+        emails = await asyncio.to_thread(accounts.emails)
+        result["all"] = {**everyone, "users": [{**row, "email": emails.get(row["user_id"], f"#{row['user_id']}")}
+                                               for row in everyone["users"]]}
+    return result
 
 
 class Settings(BaseModel):
@@ -1002,7 +1016,8 @@ async def websocket(ws: WebSocket):
                     finished_actions.append(f"{tool} {json.dumps(arguments, ensure_ascii=False)}")
 
             def chat(messages, **options):
-                return stream_chat(DEEPSEEK_URL, API_KEY, LLM_MODEL, messages, **options)
+                return stream_chat(DEEPSEEK_URL, API_KEY, LLM_MODEL, messages, **options,
+                                   on_usage=lambda used: usage.LEDGER.record_chat(context.user_id, LLM_MODEL, used))
 
             user_message = {"role": "user", "content": text}
             system_message = {"role": "system", "content": build_system_prompt(

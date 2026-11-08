@@ -3,6 +3,7 @@ import pytest
 from accounts import AccountStore
 import app
 import llm_client
+import usage
 import user_context
 
 
@@ -15,6 +16,7 @@ def user(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(llm_client, "RETRY_DELAYS", (0, 0))
     monkeypatch.setattr(app, "LATENCY_FILE", tmp_path / "latency.jsonl")
+    monkeypatch.setattr(usage, "LEDGER", usage.UsageLedger(tmp_path / "usage.db"))
     monkeypatch.setattr(app, "accounts", AccountStore(tmp_path / "accounts.db"))
     monkeypatch.setattr(app, "contexts", user_context.ContextCache(tmp_path / "users"))
     # TestClient sends Host: testserver when a test passes no headers.

@@ -51,6 +51,7 @@ def test_the_request_matches_what_the_api_expects(serve):
     assert sent[0].url == "https://api.test/chat/completions"
     assert sent[0].headers["authorization"] == "Bearer test-key"
     assert json.loads(sent[0].content) == {"model": "test-model", "messages": messages, "stream": True,
+                                           "stream_options": {"include_usage": True},
                                            "thinking": {"type": "disabled"}, "max_tokens": MAX_REPLY_TOKENS}
 
 

@@ -542,3 +542,42 @@ test('the page announces whether it can play Ogg/Opus when it connects', () => {
   page.context.socket.onopen();
   assert.deepEqual(page.messages().find(m => m.type === 'client'), {type:'client', audio:['ogg-opus']});
 });
+
+function usagePage(data) {
+  const elements = new Map();
+  const get = id => {
+    if (!elements.has(id)) elements.set(id,{textContent:'',open:false,children:[],listeners:{},
+      addEventListener(name,fn){this.listeners[name]=fn;},replaceChildren(...items){this.children=items;}});
+    return elements.get(id);
+  };
+  const cell = () => ({textContent:'',style:{}});
+  const create = tag => tag==='table'
+    ? {style:{},rows:[],insertRow(){const row={cells:[],insertCell(){const c=cell();this.cells.push(c);return c;},append(c){this.cells.push(c);}};this.rows.push(row);return row;}}
+    : cell();
+  const context = {$:get,document:{createElement:create},console,fetch:async()=>({ok:true,json:async()=>data})};
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/usage.js','utf8'),context);
+  return {get,context};
+}
+const TOTALS = {calls:3,yuan:0.000123,hit_tokens:800,miss_tokens:200,output_tokens:50,searches:1,incomplete:1,unpriced:0,cache_rate:0.8};
+
+test('the spend panel loads when opened and shows money, cache rate and missing calls',async()=>{
+  const page=usagePage({today:TOTALS,month:{...TOTALS,yuan:1.5},days:[{day:'2026-11-08',...TOTALS}],agents:[{agent:'main',...TOTALS}]});
+  page.get('usagePanel').open=true; page.get('usagePanel').listeners.toggle();
+  await tick();
+  const text=page.get('usageBody').children.map(child=>child.textContent||'').join('\n');
+  assert.match(text,/今天：¥0\.0001 · 2 次对话 · 1 次搜索/);
+  assert.match(text,/本月：¥1\.50/);
+  assert.match(text,/缓存命中 80%/);
+  assert.match(text,/1 次被打断的对话没有拿到用量/);
+  assert.equal(page.get('usageBody').children.filter(child=>child.rows).length,2);
+});
+
+test('only an admin response adds the per-account table, written as plain text',async()=>{
+  const page=usagePage({today:TOTALS,month:TOTALS,days:[],agents:[],all:{month:TOTALS,users:[{email:'<b>x</b>@a.test',...TOTALS}]}});
+  await page.get('usageRefresh').onclick();
+  await tick();
+  const tables=page.get('usageBody').children.filter(child=>child.rows);
+  assert.equal(tables.length,1);
+  assert.equal(tables[0].rows[1].cells[0].textContent,'<b>x</b>@a.test');
+});

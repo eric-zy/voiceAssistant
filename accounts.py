@@ -148,3 +148,8 @@ class AccountStore:
         with contextlib.closing(self.connect()) as connection:
             row = connection.execute("SELECT id, email, is_admin FROM users WHERE email = ?", (normalize_email(email),)).fetchone()
         return self._user(row)
+
+    def emails(self):
+        """Every account's email by id, for the admin's spend table."""
+        with contextlib.closing(self.connect()) as connection:
+            return dict(connection.execute("SELECT id, email FROM users"))
