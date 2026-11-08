@@ -28,11 +28,14 @@ from conversation import Conversation
 from knowledge import MAX_DOCUMENT_BYTES
 from fillers import FillerCache, PHRASE as FILLER_PHRASE
 from llm_client import ToolCallStarted, stream_chat
-from memory_store import ActionLog
+from accounts import AccountStore
+from memory_store import ActionLog  # noqa: F401  (tests build per-user logs through app)
 import tools as agent_tools
 from tools import default_registry
+import user_context
 from urllib.parse import urlsplit
 from windows_asyncio import disconnect_logging
+from dataclasses import dataclass
 
 ROOT = Path(__file__).resolve().parent
 DEEPSEEK_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
@@ -40,7 +43,16 @@ LLM_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 API_KEY = normalize_key(os.getenv("DEEPSEEK_API_KEY", ""))
 DEFAULT_CITY = os.getenv("VOICE_DEFAULT_CITY", "合肥").strip()
 fillers = FillerCache()
-action_log = ActionLog(ROOT / "data" / "agent.db")
+accounts = AccountStore(ROOT / "data" / "accounts.db")
+contexts = user_context.ContextCache(ROOT / "data" / "users", agent_tools.knowledge_embedder)
+SESSION_COOKIE = "session"
+# Pages and sockets are accepted only from these origins; the hosts guard against DNS rebinding.
+ALLOWED_ORIGINS = {origin.strip().rstrip("/") for origin in
+                   os.getenv("VOICE_ALLOWED_ORIGINS", "http://127.0.0.1:8765,http://localhost:8765").split(",") if origin.strip()}
+ALLOWED_HOSTS = {urlsplit(origin).netloc for origin in ALLOWED_ORIGINS}
+# Behind HTTPS the cookie must be Secure; local development over plain HTTP cannot send it otherwise.
+SECURE_COOKIE = os.getenv("VOICE_SECURE_COOKIE") == "1"
+OPEN_REGISTRATION = os.getenv("VOICE_REGISTRATION", "open") == "open"
 DEMO_AUDIO_DIR = ROOT / "data" / "heard"
 LATENCY_FILE = ROOT / "data" / "latency.jsonl"
 DEMO_AUDIO_KEPT = 40
@@ -49,12 +61,13 @@ SENSEVOICE_DIR = ROOT / "models" / "sensevoice-small"
 # SenseVoice when its model is present; VOICE_ASR_PROVIDER=whisper switches back.
 ASR_PROVIDER = os.getenv("VOICE_ASR_PROVIDER", "").lower() or ("sensevoice" if (SENSEVOICE_DIR / "model.int8.onnx").is_file() else "whisper")
 SPEECH_PEAK_MIN = .5
+# Server-wide default voice for anyone who has not chosen one. It comes only from the environment: the old
+# voices/settings.json held one person's cloned voice, which must not become everyone's default.
 voice_store = VoiceStore(ROOT / "voices")
-saved_voice = voice_store.settings()
-TTS_PROVIDER = os.getenv("VOICE_TTS_PROVIDER", saved_voice.get("provider", "edge")).lower()
+TTS_PROVIDER = os.getenv("VOICE_TTS_PROVIDER", "edge").lower()
 default_voice = "Microsoft Huihui Desktop" if TTS_PROVIDER == "windows" else "zh-CN-XiaoxiaoNeural"
-VOICE = os.getenv("VOICE_TTS_VOICE", saved_voice.get("voice", default_voice) if saved_voice.get("provider") == TTS_PROVIDER else default_voice)
-CLONE_ID = saved_voice.get("profile_id", "")
+VOICE = os.getenv("VOICE_TTS_VOICE", default_voice)
+CLONE_ID = ""
 COSYVOICE_URL = os.getenv("COSYVOICE_URL", "http://127.0.0.1:50001").rstrip("/")
 CLONE_PLAYBACK = os.getenv("VOICE_CLONE_PLAYBACK", "balanced").lower()
 if CLONE_PLAYBACK not in {"balanced", "smooth", "stream"}:
@@ -163,12 +176,36 @@ class PendingConfirmation:
         self.spoken.set()
 
 
-def record_latency(timings, reply_chars):
+@dataclass(frozen=True)
+class VoiceChoice:
+    provider: str
+    voice: str
+    clone_id: str
+    store: VoiceStore
+
+
+def current_voice():
+    """The signed-in user's voice, or the server default for anything they have not chosen."""
+    context = user_context.CURRENT.get(None)
+    saved = context.settings() if context else {}
+    provider = saved.get("provider") or TTS_PROVIDER
+    voice = saved.get("voice") or VOICE
+    # A clone is only ever one of the user's own uploads.
+    return VoiceChoice(provider, voice, saved.get("profile_id", "") if context else CLONE_ID, context.voices if context else voice_store)
+
+
+def current_city():
+    context = user_context.CURRENT.get(None)
+    saved = context.settings() if context else {}
+    return saved["default_city"] if "default_city" in saved else DEFAULT_CITY
+
+
+def record_latency(timings, reply_chars, provider=""):
     """Stage timings for finding what is slow. Holds seconds and a length, never what was said."""
     try:
         LATENCY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LATENCY_FILE.open("a", encoding="utf-8") as file:
-            file.write(json.dumps({"at": time.strftime("%H:%M:%S"), "voice": TTS_PROVIDER, "reply_chars": reply_chars, **timings}) + "\n")
+            file.write(json.dumps({"at": time.strftime("%H:%M:%S"), "voice": provider, "reply_chars": reply_chars, **timings}) + "\n")
     except OSError:
         latency_log.warning("could not write the latency file")
 
@@ -284,21 +321,22 @@ async def synthesize_clone_when_free(profile, text):
 
 
 async def synthesize(text: str) -> bytes:
-    if TTS_PROVIDER == "cosyvoice":
+    choice = current_voice()
+    if choice.provider == "cosyvoice":
         try:
-            profile = voice_store.get(CLONE_ID)
+            profile = choice.store.get(choice.clone_id)
             return await synthesize_clone_when_free(profile, text)
         except (httpx.HTTPError, OSError) as error:
             raise RuntimeError("无法连接本地 CosyVoice 服务，请先运行 ./start_cosyvoice.ps1") from error
-    if TTS_PROVIDER == "windows":
-        return await synthesize_windows(text)
-    if TTS_PROVIDER != "edge":
+    if choice.provider == "windows":
+        return await synthesize_windows(text, choice.voice)
+    if choice.provider != "edge":
         raise RuntimeError("VOICE_TTS_PROVIDER 仅支持 edge、windows 或 cosyvoice")
     import edge_tts
     try:
         async with asyncio.timeout(45):
             audio = bytearray()
-            communicate = edge_tts.Communicate(text, VOICE, rate=TTS_RATE, pitch=TTS_PITCH,
+            communicate = edge_tts.Communicate(text, choice.voice, rate=TTS_RATE, pitch=TTS_PITCH,
                                               connect_timeout=10, receive_timeout=20)
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
@@ -314,18 +352,19 @@ async def synthesize(text: str) -> bytes:
 async def synthesize_parts(text):
     # Short buffered segments keep up with playback on the GTX 1060; streaming
     # re-runs flow for every chunk, so it stays opt-in.
-    if TTS_PROVIDER != "cosyvoice" or CLONE_PLAYBACK != "stream":
+    choice = current_voice()
+    if choice.provider != "cosyvoice" or CLONE_PLAYBACK != "stream":
         yield await synthesize(text)
         return
     try:
-        async with contextlib.aclosing(stream_clone(voice_store.get(CLONE_ID), text, COSYVOICE_URL)) as chunks:
+        async with contextlib.aclosing(stream_clone(choice.store.get(choice.clone_id), text, COSYVOICE_URL)) as chunks:
             async for audio in chunks:
                 yield audio
     except httpx.HTTPError as error:
         raise RuntimeError("无法连接流式克隆服务，请检查 CosyVoice 服务窗口") from error
 
 
-async def synthesize_windows(text: str) -> bytes:
+async def synthesize_windows(text: str, voice: str = "") -> bytes:
     if os.name != "nt":
         raise RuntimeError("当前语音合成使用 Windows System.Speech")
     runtime_temp = ROOT / "work" / "runtime-temp"
@@ -333,7 +372,7 @@ async def synthesize_windows(text: str) -> bytes:
     with tempfile.TemporaryDirectory(prefix="voice-chat-", dir=runtime_temp) as folder:
         input_path = Path(folder) / "request.json"
         output_path = Path(folder) / "speech.wav"
-        input_path.write_text(json.dumps({"text": text, "voice": VOICE}, ensure_ascii=False), encoding="utf-8")
+        input_path.write_text(json.dumps({"text": text, "voice": voice or VOICE}, ensure_ascii=False), encoding="utf-8")
         process = await asyncio.create_subprocess_exec(
             "powershell.exe", "-NoProfile", "-NonInteractive", "-File", str(ROOT / "speak.ps1"),
             "-InputPath", str(input_path), "-OutputPath", str(output_path),
@@ -350,120 +389,212 @@ async def synthesize_windows(text: str) -> bytes:
                 await process.wait()
 
 
+def default_session_user(connection):
+    """The signed-in user for a request or socket, from its session cookie, or None."""
+    user = accounts.user_for_token(connection.cookies.get(SESSION_COOKIE))
+    return contexts.get(user) if user else None
+
+
+# Looked up at call time, so tests can stand in a known user without weakening the origin checks.
+session_user = default_session_user
+
+
+def require_user(request, write=False):
+    """Every API call: an allowed host, an allowed origin for anything that changes data, and a session.
+
+    Plain GETs carry no Origin, so Host is what stops another site reaching this through DNS rebinding;
+    writes also need Origin, which with SameSite cookies is the cross-site request defence.
+    """
+    if request.headers.get("host") not in ALLOWED_HOSTS:
+        raise HTTPException(403, "请通过本站页面操作")
+    if write and request.headers.get("origin") not in ALLOWED_ORIGINS:
+        raise HTTPException(403, "请通过本站页面操作")
+    context = session_user(request)
+    if context is None:
+        raise HTTPException(401, "请先登录")
+    user_context.CURRENT.set(context)
+    return context
+
+
+def require_page_origin(request):
+    if request.headers.get("host") not in ALLOWED_HOSTS or request.headers.get("origin") not in ALLOWED_ORIGINS:
+        raise HTTPException(403, "请通过本站页面操作")
+
+
 @app.get("/")
-async def index():
-    return FileResponse(ROOT / "static" / "index.html")
+async def index(request: Request):
+    page = "index.html" if session_user(request) else "login.html"
+    return FileResponse(ROOT / "static" / page, headers={"Cache-Control": "no-store"})
+
+
+class Credentials(BaseModel):
+    email: str
+    password: str
+
+
+def signed_in(user):
+    response = Response(json.dumps({"email": user["email"]}), media_type="application/json")
+    response.set_cookie(SESSION_COOKIE, accounts.start_session(user["id"]), max_age=30 * 24 * 3600,
+                        httponly=True, samesite="lax", secure=SECURE_COOKIE, path="/")
+    return response
+
+
+@app.post("/api/register")
+async def register(request: Request, credentials: Credentials):
+    require_page_origin(request)
+    if not OPEN_REGISTRATION:
+        raise HTTPException(403, "暂未开放注册")
+    try:
+        user = await asyncio.to_thread(accounts.register, credentials.email, credentials.password)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return signed_in(user)
+
+
+@app.post("/api/login")
+async def login(request: Request, credentials: Credentials):
+    require_page_origin(request)
+    try:
+        user = await asyncio.to_thread(accounts.authenticate, credentials.email, credentials.password)
+    except PermissionError as error:
+        raise HTTPException(429, str(error)) from error
+    if user is None:
+        # One message for both cases, so the page does not reveal which emails have accounts.
+        raise HTTPException(401, "邮箱或密码不正确")
+    return signed_in(user)
+
+
+@app.post("/api/logout")
+async def logout(request: Request):
+    require_page_origin(request)
+    accounts.end_session(request.cookies.get(SESSION_COOKIE))
+    response = Response(json.dumps({"ok": True}), media_type="application/json")
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
+@app.get("/api/me")
+async def me(request: Request):
+    context = require_user(request)
+    return {"email": context.email, "is_admin": context.is_admin}
+
+
+class Settings(BaseModel):
+    default_city: str
+
+
+@app.post("/api/settings")
+async def save_settings(request: Request, settings: Settings):
+    context = require_user(request, write=True)
+    city = settings.default_city.strip()
+    if len(city) > 30:
+        raise HTTPException(400, "城市名太长")
+    context.save_settings({"default_city": city})
+    return {"default_city": city}
 
 
 @app.get("/api/status")
-async def status():
+async def status(request: Request):
+    context = require_user(request)
     # Do not return credentials or claim key validity without calling the provider.
-    display_voice = VOICE
-    if TTS_PROVIDER == "cosyvoice":
+    choice = current_voice()
+    display_voice = choice.voice
+    if choice.provider == "cosyvoice":
         try:
-            display_voice = voice_store.get(CLONE_ID)["name"]
+            display_voice = choice.store.get(choice.clone_id)["name"]
         except (ValueError, OSError, KeyError):
             display_voice = "参考音色缺失，请重新选择"
     asr_ready = (SENSEVOICE_DIR / "model.int8.onnx").is_file() if ASR_PROVIDER == "sensevoice" else (Path(ASR_MODEL) / "model.bin").is_file()
+    # Server details are for administrators; everyone else learns only what affects their own use.
+    server = {"key_fingerprint": fingerprint(API_KEY), "api_host": urlsplit(DEEPSEEK_URL).hostname,
+              "server_pid": os.getpid()} if context.is_admin else {}
     return {"asr_ready": asr_ready, "asr_provider": ASR_PROVIDER, "llm_model": LLM_MODEL,
-            "tts_voice": display_voice,
-            "tts_provider": TTS_PROVIDER,
-            "clone_playback": CLONE_PLAYBACK,
+            "tts_voice": display_voice, "tts_provider": choice.provider, "clone_playback": CLONE_PLAYBACK,
             "tts_rate": TTS_RATE, "tts_pitch": TTS_PITCH, "api_key_configured": bool(API_KEY),
-            "key_fingerprint": fingerprint(API_KEY),
-            "api_host": urlsplit(DEEPSEEK_URL).hostname, "server_pid": os.getpid(), "voice_protocol": 4,
-            "tools": list(default_registry.tools)}
-
-
-def require_local_page(request):
-    if request.headers.get("origin") not in {"http://127.0.0.1:8765", "http://localhost:8765"}:
-        raise HTTPException(403, "请通过本机项目页面操作")
-
-
-def require_local_host(request):
-    # Plain GETs carry no Origin. Checking Host stops another site reaching this through DNS rebinding.
-    if request.headers.get("host") not in {"127.0.0.1:8765", "localhost:8765"}:
-        raise HTTPException(403, "请通过本机项目页面操作")
+            "voice_protocol": 4, "tools": list(default_registry.tools), "default_city": current_city(),
+            "email": context.email, **server}
 
 
 @app.get("/api/memories")
 async def list_memories(request: Request):
-    require_local_host(request)
-    return {"memories": agent_tools.memories.recent()}
+    context = require_user(request)
+    return {"memories": context.memories.recent()}
 
 
 @app.delete("/api/memories/{memory_id}")
 async def delete_memory(request: Request, memory_id: int):
-    require_local_page(request)
-    if agent_tools.memories.forget(memory_id) is None:
+    context = require_user(request, write=True)
+    if context.memories.forget(memory_id) is None:
         raise HTTPException(404, "没有这条记忆")
-    action_log.record("forget", {"memory_id": memory_id}, "page", "executed")
+    context.action_log.record("forget", {"memory_id": memory_id}, "page", "executed")
     return {"ok": True}
 
 
 @app.post("/api/memories/{memory_id}/restore")
 async def restore_memory(request: Request, memory_id: int):
-    require_local_page(request)
-    if not agent_tools.memories.restore(memory_id):
+    context = require_user(request, write=True)
+    if not context.memories.restore(memory_id):
         raise HTTPException(404, "没有可恢复的记忆")
-    action_log.record("restore", {"memory_id": memory_id}, "page", "executed")
+    context.action_log.record("restore", {"memory_id": memory_id}, "page", "executed")
     return {"ok": True}
 
 
 @app.get("/api/knowledge")
 async def list_documents(request: Request):
-    require_local_host(request)
-    return {"files": await asyncio.to_thread(agent_tools.knowledge.list_files)}
+    context = require_user(request)
+    return {"files": await asyncio.to_thread(context.knowledge.list_files)}
 
 
 @app.post("/api/knowledge")
 async def upload_document(request: Request, file: UploadFile = File()):
-    require_local_page(request)
+    context = require_user(request, write=True)
     # One past the limit is enough to reject it without holding an arbitrarily large upload.
     data = await file.read(MAX_DOCUMENT_BYTES + 1)
     try:
-        saved = await asyncio.to_thread(agent_tools.knowledge.save, file.filename or "", data)
+        saved = await asyncio.to_thread(context.knowledge.save, file.filename or "", data)
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
-    action_log.record("upload_document", {"name": saved["name"]}, "page", "executed")
+    context.action_log.record("upload_document", {"name": saved["name"]}, "page", "executed")
     return saved
 
 
 @app.delete("/api/knowledge/{name:path}")
 async def delete_document(request: Request, name: str):
-    require_local_page(request)
-    if not await asyncio.to_thread(agent_tools.knowledge.delete, name):
+    context = require_user(request, write=True)
+    if not await asyncio.to_thread(context.knowledge.delete, name):
         raise HTTPException(404, "没有这个文件")
-    action_log.record("delete_document", {"name": name}, "page", "executed")
+    context.action_log.record("delete_document", {"name": name}, "page", "executed")
     return {"ok": True}
 
 
 @app.get("/api/reminders")
 async def list_reminders(request: Request):
-    require_local_host(request)
-    return {"reminders": agent_tools.reminders.pending()}
+    context = require_user(request)
+    return {"reminders": context.reminders.pending()}
 
 
 @app.delete("/api/reminders/{reminder_id}")
 async def delete_reminder(request: Request, reminder_id: int):
-    require_local_page(request)
-    if agent_tools.reminders.cancel(reminder_id) is None:
+    context = require_user(request, write=True)
+    if context.reminders.cancel(reminder_id) is None:
         raise HTTPException(404, "没有这条提醒")
-    action_log.record("cancel_reminder", {"reminder_id": reminder_id}, "page", "executed")
+    context.action_log.record("cancel_reminder", {"reminder_id": reminder_id}, "page", "executed")
     return {"ok": True}
 
 
 @app.post("/api/reminders/{reminder_id}/restore")
 async def restore_reminder(request: Request, reminder_id: int):
-    require_local_page(request)
-    if not agent_tools.reminders.restore(reminder_id):
+    context = require_user(request, write=True)
+    if not context.reminders.restore(reminder_id):
         raise HTTPException(404, "没有可恢复的提醒")
-    action_log.record("restore_reminder", {"reminder_id": reminder_id}, "page", "executed")
+    context.action_log.record("restore_reminder", {"reminder_id": reminder_id}, "page", "executed")
     return {"ok": True}
 
 
 @app.get("/api/voices")
-async def voices():
+async def voices(request: Request):
+    context = require_user(request)
+    choice = current_voice()
     ready = False
     service = {}
     try:
@@ -473,22 +604,49 @@ async def voices():
             ready = service.get("ready", False)
     except (httpx.HTTPError, ValueError):
         pass
-    return {"profiles":voice_store.list(), "provider":TTS_PROVIDER, "voice":VOICE,
-            "profile_id":CLONE_ID, "clone_service_ready":ready,
+    return {"profiles":context.voices.list(), "provider":choice.provider, "voice":choice.voice,
+            "profile_id":choice.clone_id, "clone_service_ready":ready,
             "clone_service_busy":service.get("busy", False), "clone_device":service.get("device", "unknown")}
 
 
 @app.post("/api/voices")
 async def upload_voice(request: Request, name: str = Form(), prompt_text: str = Form(), audio: UploadFile = File()):
-    require_local_page(request)
+    context = require_user(request, write=True)
     data = await audio.read(10 * 1024 * 1024 + 1)
     await audio.close()
     if len(data) > 10 * 1024 * 1024:
         raise HTTPException(413, "参考录音不可超过10MB")
     try:
-        return await asyncio.to_thread(voice_store.add, name, prompt_text, data)
+        profile = await asyncio.to_thread(context.voices.add, name, prompt_text, data)
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
+    problem = await asyncio.to_thread(reference_mismatch, context.voices.get(profile["id"]))
+    if problem:
+        context.voices.remove(profile["id"])
+        raise HTTPException(400, problem)
+    return profile
+
+
+# CosyVoice aligns the reference audio to its transcript. A 16.6 s clip saved with a 4-character transcript
+# produced clone speech that read back as unrelated words, so a transcript that does not match is refused.
+REFERENCE_MIN_SIMILARITY = .5
+
+
+def reference_mismatch(profile):
+    """Return why the transcript does not match the reference audio, or "" when it does or cannot be checked."""
+    with wave.open(str(profile["wav_path"]), "rb") as reference:
+        pcm = reference.readframes(reference.getnframes())
+    try:
+        heard = transcribe(pcm[:MAX_BYTES - MAX_BYTES % 2])
+    except Exception:
+        latency_log.exception("could not check a reference transcript")
+        return ""
+    heard_words, given = re.sub(r"[\W_]+", "", heard), re.sub(r"[\W_]+", "", profile["prompt_text"])
+    if not heard_words:
+        return ""
+    if SequenceMatcher(None, heard_words, given, autojunk=False).ratio() >= REFERENCE_MIN_SIMILARITY:
+        return ""
+    return f"填写的文字和录音内容对不上，克隆出来的声音会念错。录音里识别到的是：{heard[:120]}。请照录音实际说的话填写。"
 
 
 class VoiceSelection(BaseModel):
@@ -499,26 +657,25 @@ class VoiceSelection(BaseModel):
 
 @app.post("/api/voice/select")
 async def select_voice(request: Request, selection: VoiceSelection):
-    require_local_page(request)
+    context = require_user(request, write=True)
     if selection.provider not in {"edge", "windows", "cosyvoice"}:
         raise HTTPException(400, "未知语音引擎")
     if not 1 <= len(selection.voice) <= 120:
         raise HTTPException(400, "音色名称长度无效")
     if selection.provider == "cosyvoice":
         try:
-            voice_store.get(selection.profile_id)
+            # Only the user's own uploads: another user's profile id is not found here.
+            context.voices.get(selection.profile_id)
         except (ValueError, OSError) as error:
             raise HTTPException(400, "请先上传并选择参考音色") from error
-    global TTS_PROVIDER, VOICE, CLONE_ID
-    settings = selection.model_dump()
-    voice_store.save_settings(settings)
-    TTS_PROVIDER, VOICE, CLONE_ID = selection.provider, selection.voice, selection.profile_id
+    # A personal setting: choosing a voice no longer changes it for everyone.
+    context.save_settings(selection.model_dump())
     return {"ok":True}
 
 
 @app.post("/api/mic-test")
 async def mic_test(request: Request):
-    require_local_page(request)
+    context = require_user(request, write=True)
     pcm = await request.body()
     if len(pcm) > MAX_BYTES or len(pcm) % 2:
         raise HTTPException(400, "录音长度无效")
@@ -527,7 +684,7 @@ async def mic_test(request: Request):
 
 @app.post("/api/voice/preview")
 async def preview_voice(request: Request):
-    require_local_page(request)
+    context = require_user(request, write=True)
     task = asyncio.create_task(synthesize("你好，今天过得怎么样？"))
     try:
         while not task.done():
@@ -550,11 +707,18 @@ async def preview_voice(request: Request):
 
 @app.websocket("/ws")
 async def websocket(ws: WebSocket):
-    # Loopback service, no cross-origin microphone/audio ingestion.
-    if ws.headers.get("origin") not in {"http://127.0.0.1:8765", "http://localhost:8765"}:
+    # No cross-origin microphone/audio ingestion, and no socket without a signed-in user.
+    if ws.headers.get("origin") not in ALLOWED_ORIGINS:
         await ws.close(code=1008)
         return
+    context = session_user(ws)
     await ws.accept()
+    if context is None:
+        # A custom code the page can tell apart from a dropped connection, so it shows the sign-in page.
+        await ws.close(code=4401)
+        return
+    # Everything this socket starts, replies, reminders and tools alike, inherits this user.
+    user_context.CURRENT.set(context)
     watcher = None
     history = Conversation()
     finished_actions = []
@@ -599,7 +763,7 @@ async def websocket(ws: WebSocket):
         while True:
             await asyncio.sleep(REMINDER_POLL_SECONDS)
             try:
-                if can_interrupt_nobody() and (due := agent_tools.reminders.claim_due()):
+                if can_interrupt_nobody() and (due := context.reminders.claim_due()):
                     claimed[due["id"]] = due
                     await send("reminder_due", None, reminder_id=due["id"])
             except Exception:
@@ -607,7 +771,7 @@ async def websocket(ws: WebSocket):
 
     async def announce(rid, reminder):
         text = agent_tools.reminder_speech(reminder)
-        agent_tools.reminders.mark_delivered(reminder["id"])
+        context.reminders.mark_delivered(reminder["id"])
         await send("token", rid, text=text)
         failed = False
         try:
@@ -666,7 +830,7 @@ async def websocket(ws: WebSocket):
                 action, reason = confirmation_action(heard, recent_text, confirmation.accepts(started))
                 # Only with the demo on: real use should not keep what people say here.
                 if default_registry.get("demo_confirm"):
-                    action_log.record("confirm_heard", {}, "listen", action, heard)
+                    context.action_log.record("confirm_heard", {}, "listen", action, heard)
                 if action == "ignored":
                     await voice("ignored", reason=reason)
                 elif action == "question":
@@ -692,6 +856,8 @@ async def websocket(ws: WebSocket):
 
     async def reply(rid, text=None, audio=None, source="text"):
         worker = None
+        # Read once per reply, so a voice change applies from the next reply, never halfway through one.
+        voice = current_voice()
         tts_failed = False
         started = time.perf_counter()
         first_audio = True
@@ -734,7 +900,7 @@ async def websocket(ws: WebSocket):
                         continue
                     try:
                         label = "正在合成语音…"
-                        if TTS_PROVIDER == "cosyvoice":
+                        if voice.provider == "cosyvoice":
                             label = {"stream":"正在流式合成语音…", "smooth":"正在合成完整回复，完成后连续播放；文字可先阅读…",
                                      "balanced":"正在合成首段（最多20字）…" if first_audio else "正在合成下一小段（最多20字），文字可先阅读…"}[CLONE_PLAYBACK]
                         await send("status", rid, text=label)
@@ -749,11 +915,11 @@ async def websocket(ws: WebSocket):
                         failed = True
                         tts_failed = True
                         reason = str(error) if isinstance(error, (ValueError, RuntimeError)) else "请检查网络及音色配置"
-                        await send("warning", rid, text=f"{TTS_PROVIDER} 播报失败：{reason}；文字回复仍可使用")
+                        await send("warning", rid, text=f"{voice.provider} 播报失败：{reason}；文字回复仍可使用")
 
             worker = asyncio.create_task(speak_worker())
             # Bound all balanced-mode chunks, including the remainder after the lead.
-            clone_full_reply = TTS_PROVIDER == "cosyvoice"
+            clone_full_reply = voice.provider == "cosyvoice"
             pending = ""
             filler_played = False
 
@@ -771,7 +937,7 @@ async def websocket(ws: WebSocket):
                     # Text already spoken covers the wait, and two parallel calls need one filler.
                     if tool and tool.filler and first_token and not filler_played:
                         filler_played = True
-                        audio = fillers.take((TTS_PROVIDER, VOICE, CLONE_ID), synthesize)
+                        audio = fillers.take((voice.provider, voice.voice, voice.clone_id), synthesize)
                         if audio:
                             mark("filler")
                             await send_audio(rid, audio, FILLER_PHRASE)
@@ -820,7 +986,7 @@ async def websocket(ws: WebSocket):
                 return approved, detail
 
             def audit(tool, arguments, outcome, detail):
-                action_log.record(tool, arguments, source, outcome, detail)
+                context.action_log.record(tool, arguments, source, outcome, detail)
                 # Kept until a reply finishes, so a turn cut off after a write still reaches the model.
                 if outcome == "executed":
                     finished_actions.append(f"{tool} {json.dumps(arguments, ensure_ascii=False)}")
@@ -830,7 +996,7 @@ async def websocket(ws: WebSocket):
 
             user_message = {"role": "user", "content": text}
             system_message = {"role": "system", "content": build_system_prompt(
-                SYSTEM, DEFAULT_CITY, agent_tools.memories.recent(), finished_actions, agent_tools.reminders.pending())}
+                SYSTEM, current_city(), context.memories.recent(), finished_actions, context.reminders.pending())}
             demo = default_registry.get("demo_confirm") and re.sub(r"[\W_]+", "", text) == DEMO_PHRASE
             added = await run_turn([system_message, *history.messages(), user_message], default_registry,
                                    demo_chat if demo else chat, on_llm_event, confirm, audit)
@@ -843,7 +1009,7 @@ async def websocket(ws: WebSocket):
             history.add_turn([user_message, *without_outside_results(added, default_registry)])
             finished_actions.clear()
             await send("done", rid, tts_failed=tts_failed)
-            record_latency(timings, len(added[-1].get("content") or ""))
+            record_latency(timings, len(added[-1].get("content") or ""), voice.provider)
         except asyncio.CancelledError:
             raise
         except Exception as error:

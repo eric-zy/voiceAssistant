@@ -12,12 +12,9 @@ import httpx
 
 from api_config import auth_error, normalize_key
 from embedding import Embedder
-from knowledge import KnowledgeBase
-from memory_store import MemoryStore, ReminderStore
+import user_context
 
 log = logging.getLogger("uvicorn.error")
-memories = MemoryStore(Path(__file__).resolve().parent / "data" / "agent.db")
-reminders = ReminderStore(memories.path)
 EMBEDDING_MODEL = Path(__file__).resolve().parent / "models" / "bge-small-zh"
 
 
@@ -27,7 +24,19 @@ def knowledge_embedder():
     return Embedder(EMBEDDING_MODEL) if os.getenv("VOICE_KB_VECTORS") == "1" else None
 
 
-knowledge = KnowledgeBase(Path(__file__).resolve().parent / "knowledge", memories.path.parent / "knowledge.db", knowledge_embedder())
+# Every tool works on the signed-in user's own stores, never on a shared one.
+def memories():
+    return user_context.current().memories
+
+
+def reminders():
+    return user_context.current().reminders
+
+
+def knowledge():
+    return user_context.current().knowledge
+
+
 MAX_MEMORY_CHARS = 200
 # Past this, say it is late instead of pretending it is on time.
 REMINDER_LATE_SECONDS = 120
@@ -231,7 +240,7 @@ async def search_docs(query):
     text = query.strip()
     if not text:
         raise ToolError("查询内容不能为空")
-    count, hits = await asyncio.to_thread(knowledge.search, text)
+    count, hits = await asyncio.to_thread(knowledge().search, text)
     if not count:
         return {"results": [], "message": "知识库还是空的。可以在页面底部的“知识库”上传文件"}
     if not hits:
@@ -255,21 +264,21 @@ async def remember(content):
     text = content.strip()
     if not 1 <= len(text) <= MAX_MEMORY_CHARS:
         raise ToolError(f"记忆内容要在 1 到 {MAX_MEMORY_CHARS} 字之间")
-    memory_id = memories.add(text)
+    memory_id = memories().add(text)
     return {"saved": True, "say": f"记住了：{text}", "undo": {"action": "delete", "id": memory_id}}
 
 
 async def forget(memory_id):
     if not memory_id.strip().isdecimal():
         raise ToolError("memory_id 必须是记忆的编号")
-    content = memories.forget(int(memory_id))
+    content = memories().forget(int(memory_id))
     if content is None:
         raise ToolError(f"没有编号为 {memory_id} 的记忆")
     return {"forgotten": True, "say": f"已经忘掉：{content}", "undo": {"action": "restore", "id": int(memory_id)}}
 
 
 async def clear_memories():
-    return {"cleared": True, "say": f"已清空全部记忆，共 {memories.clear()} 条。", "changed": True}
+    return {"cleared": True, "say": f"已清空全部记忆，共 {memories().clear()} 条。", "changed": True}
 
 
 def spoken_time(moment):
@@ -301,14 +310,14 @@ async def set_reminder(content, due_at):
         raise ToolError(f"提醒内容要在 1 到 {MAX_MEMORY_CHARS} 字之间")
     if due <= datetime.now():
         raise ToolError(f"提醒时间 {due_at} 已经过去了，请和用户确认时间")
-    reminder_id = reminders.add(text, due)
+    reminder_id = reminders().add(text, due)
     return {"saved": True, "say": f"提醒设好了，{spoken_time(due)}：{text}", "undo": {"kind": "reminder", "action": "delete", "id": reminder_id}}
 
 
 async def cancel_reminder(reminder_id):
     if not reminder_id.strip().isdecimal():
         raise ToolError("reminder_id 必须是提醒的编号")
-    reminder = reminders.cancel(int(reminder_id))
+    reminder = reminders().cancel(int(reminder_id))
     if reminder is None:
         raise ToolError(f"没有编号为 {reminder_id} 的待办提醒")
     return {"cancelled_reminder": True, "say": f"已取消提醒：{reminder['content']}", "undo": {"kind": "reminder", "action": "restore", "id": reminder["id"]}}

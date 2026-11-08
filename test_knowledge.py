@@ -147,9 +147,9 @@ def call_tool(query):
 
 
 @pytest.fixture
-def docs(tmp_path, monkeypatch):
+def docs(tmp_path, monkeypatch, user):
     store = KnowledgeBase(tmp_path / "docs", tmp_path / "docs.db")
-    monkeypatch.setattr(tools, "knowledge", store)
+    monkeypatch.setattr(user, "knowledge", store)
     return store
 
 

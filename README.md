@@ -2,6 +2,19 @@
 
 当前工作目录统一为 `F:\wkspace\local_voice_chat`。音色改进见 [音色升级方案](音色升级方案.md)。
 
+## 账号
+
+现在需要登录才能使用，每个账号的记忆、提醒、知识库、音色和默认城市互不可见，数据在 `data/users/<编号>/`。
+
+第一次升级后，先在终端创建管理员账号，再把原来的数据导入这个账号（只复制，不移动原文件）：
+
+```powershell
+.venv/Scripts/python.exe manage.py create-admin 你的邮箱
+.venv/Scripts/python.exe manage.py import-legacy 你的邮箱
+```
+
+其他人可以在登录页自己注册。设置 `VOICE_REGISTRATION=closed` 可关闭注册；部署到正式域名时，用 `VOICE_ALLOWED_ORIGINS` 指定允许的地址，上了 HTTPS 再设置 `VOICE_SECURE_COOKIE=1`。说明见 [S1 解析](docs/S1-账号与数据隔离解析.md)。
+
 ## 语音识别
 
 默认用 SenseVoice Small（`models/sensevoice-small`），在 CPU 上运行。和原来的 Whisper base 相比，它在这台电脑的摄像头麦克风上能认出短口令，速度也快约 4 倍。没有人声时它会硬凑出一个“我”字，所以识别前先用 Silero 判断有没有人声。
