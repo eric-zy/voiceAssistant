@@ -165,3 +165,89 @@ class ReminderStore:
         with contextlib.closing(self.connect()) as connection, connection:
             return connection.execute("UPDATE reminders SET status = 'pending', claimed_at = NULL WHERE id = ? AND status = 'cancelled'",
                                       (reminder_id,)).rowcount > 0
+
+
+TASK_SCHEMA = """CREATE TABLE IF NOT EXISTS agent_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, title TEXT NOT NULL, input_json TEXT NOT NULL,
+    status TEXT NOT NULL, progress TEXT NOT NULL DEFAULT '', result_json TEXT, error TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, seen INTEGER NOT NULL DEFAULT 0)"""
+TASK_COLUMNS = "id, kind, title, status, progress, result_json, error, created_at, started_at, finished_at, seen"
+ACTIVE = ("queued", "running")
+
+
+class TaskStore:
+    """Background work one user started: queued, running, then done, failed or cancelled.
+
+    The input stays here so a task can be rerun or inspected; results are JSON written by the feature.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def connect(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path)
+        connection.execute(TASK_SCHEMA)
+        return connection
+
+    @staticmethod
+    def _task(row):
+        if not row:
+            return None
+        task = dict(zip(TASK_COLUMNS.split(", "), row))
+        task["result"] = json.loads(task.pop("result_json")) if task["result_json"] else None
+        task["seen"] = bool(task["seen"])
+        return task
+
+    def add(self, kind, title, payload):
+        with contextlib.closing(self.connect()) as connection, connection:
+            return connection.execute("INSERT INTO agent_tasks (kind, title, input_json, status, created_at) VALUES (?, ?, ?, 'queued', ?)",
+                                      (kind, title, json.dumps(payload, ensure_ascii=False), now())).lastrowid
+
+    def get(self, task_id):
+        with contextlib.closing(self.connect()) as connection:
+            return self._task(connection.execute(f"SELECT {TASK_COLUMNS} FROM agent_tasks WHERE id = ?", (task_id,)).fetchone())
+
+    def payload(self, task_id):
+        with contextlib.closing(self.connect()) as connection:
+            row = connection.execute("SELECT input_json FROM agent_tasks WHERE id = ?", (task_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def recent(self, limit=20):
+        with contextlib.closing(self.connect()) as connection:
+            return [self._task(row) for row in connection.execute(f"SELECT {TASK_COLUMNS} FROM agent_tasks ORDER BY id DESC LIMIT ?", (limit,))]
+
+    def _move(self, task_id, sql, args, allowed):
+        marks = ", ".join("?" * len(allowed))
+        with contextlib.closing(self.connect()) as connection, connection:
+            return connection.execute(f"UPDATE agent_tasks SET {sql} WHERE id = ? AND status IN ({marks})",
+                                      (*args, task_id, *allowed)).rowcount > 0
+
+    def start(self, task_id):
+        return self._move(task_id, "status = 'running', started_at = ?", (now(),), ("queued",))
+
+    def set_progress(self, task_id, text):
+        return self._move(task_id, "progress = ?", (text[:200],), ("running",))
+
+    def finish(self, task_id, result):
+        return self._move(task_id, "status = 'done', progress = '', result_json = ?, finished_at = ?",
+                          (json.dumps(result, ensure_ascii=False), now()), ("running",))
+
+    def fail(self, task_id, error):
+        return self._move(task_id, "status = 'failed', progress = '', error = ?, finished_at = ?", (error[:300], now()), ACTIVE)
+
+    def cancel(self, task_id):
+        """True when it was still queued or running; a finished task stays as it is."""
+        return self._move(task_id, "status = 'cancelled', progress = '', finished_at = ?", (now(),), ACTIVE)
+
+    def mark_seen(self, task_id):
+        with contextlib.closing(self.connect()) as connection, connection:
+            return connection.execute("UPDATE agent_tasks SET seen = 1 WHERE id = ?", (task_id,)).rowcount > 0
+
+    def recover_interrupted(self):
+        """At startup nothing can be running yet, so anything marked active was cut off by a restart."""
+        if not self.path.exists():  # a new user has nothing to recover; do not create files just to look
+            return
+        with contextlib.closing(self.connect()) as connection, connection:
+            connection.execute("UPDATE agent_tasks SET status = 'failed', progress = '', error = '服务重启，任务中断，请重新提交', "
+                               "finished_at = ? WHERE status IN ('queued', 'running')", (now(),))

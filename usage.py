@@ -5,6 +5,7 @@ shown per user, per day and per agent before more agents start calling the model
 Prices are yuan per million tokens at peak; off-peak is half (DeepSeek pricing page, 2026-11).
 """
 import contextlib
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
@@ -21,6 +22,9 @@ PRICES = {
     "deepseek-v4-pro": {"hit": 0.30, "miss": 9.0, "output": 27.0},
 }
 SEARCH_YUAN = 0.005  # 5 yuan per 1,000 successful searches.
+# Which agent is spending, and an optional running total for one agent run, so a budget can stop it.
+CURRENT_AGENT = ContextVar("current_agent", default="main")
+METER = ContextVar("spend_meter", default=None)
 SCHEMA = """CREATE TABLE IF NOT EXISTS usage (
     id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, day TEXT NOT NULL, created_at TEXT NOT NULL,
     kind TEXT NOT NULL, agent TEXT NOT NULL, model TEXT NOT NULL, hit_tokens INTEGER NOT NULL DEFAULT 0,
@@ -54,6 +58,9 @@ class UsageLedger:
 
     def _insert(self, user_id, kind, agent, model, moment, hit=0, miss=0, output=0, cost=None, complete=True):
         moment = (moment or datetime.now(BEIJING)).astimezone(BEIJING)
+        meter = METER.get()
+        if meter is not None and cost:
+            meter["yuan"] += cost
         # Losing a ledger row must never cost the user their reply.
         try:
             with contextlib.closing(self.connect()) as connection, connection:
@@ -65,13 +72,14 @@ class UsageLedger:
         except sqlite3.Error:
             log.exception("could not write the usage ledger")
 
-    def record_chat(self, user_id, model, usage, agent="main", moment=None):
+    def record_chat(self, user_id, model, usage, agent=None, moment=None):
         """usage is DeepSeek's usage object, or None when the stream was cut off before it arrived.
 
         A cut-off call is still billed for what it used, but the count never reached us; it is kept as an
         incomplete row so the page can say how many calls are missing instead of quietly reporting less.
         """
         moment = moment or datetime.now(BEIJING)
+        agent = agent or CURRENT_AGENT.get()
         if usage is None:
             self._insert(user_id, "chat", agent, model, moment, complete=False)
             return
@@ -82,8 +90,15 @@ class UsageLedger:
         output = usage.get("completion_tokens") or 0
         self._insert(user_id, "chat", agent, model, moment, hit, miss, output, chat_cost(model, hit, miss, output, moment))
 
-    def record_search(self, user_id, agent="main", moment=None):
-        self._insert(user_id, "search", agent, "web_search", moment, cost=SEARCH_YUAN)
+    def record_search(self, user_id, agent=None, moment=None):
+        self._insert(user_id, "search", agent or CURRENT_AGENT.get(), "web_search", moment, cost=SEARCH_YUAN)
+
+    def spent_today(self, user_id, today=None):
+        """Yuan this user has spent today, for budget checks before another call."""
+        today = (today or datetime.now(BEIJING).date()).isoformat()
+        with contextlib.closing(self.connect()) as connection:
+            return connection.execute("SELECT COALESCE(SUM(cost_yuan), 0) FROM usage WHERE user_id = ? AND day = ?",
+                                      (user_id, today)).fetchone()[0]
 
     def summary(self, user_id=None, days=14, today=None):
         """Totals for today, this month and each recent day; by agent; by user when user_id is None (admin)."""

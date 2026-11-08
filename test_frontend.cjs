@@ -581,3 +581,47 @@ test('only an admin response adds the per-account table, written as plain text',
   assert.equal(tables.length,1);
   assert.equal(tables[0].rows[1].cells[0].textContent,'<b>x</b>@a.test');
 });
+
+function taskPage(responses) {
+  const elements = new Map(), calls = [], timers = [];
+  const get = id => {
+    if (!elements.has(id)) elements.set(id,{textContent:'',hidden:false,open:false,children:[],style:{},replaceChildren(...items){this.children=items;}});
+    return elements.get(id);
+  };
+  const create = () => ({style:{},textContent:'',children:[],append(...items){this.children.push(...items);}});
+  let index = 0;
+  const context = {$:get,document:{createElement:create},console,status(text){get('status').textContent=text;},
+    setTimeout:(fn,ms)=>{timers.push(ms);return timers.length;},clearTimeout(){},
+    fetch:async(url,options={})=>{calls.push([options.method||'GET',url]);
+      const body=url==='/api/tasks'&&!options.method?responses[Math.min(index++,responses.length-1)]:{};
+      return {ok:true,json:async()=>body};}};
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/tasks.js','utf8'),context);
+  return {get,context,calls,timers};
+}
+const RUNNING = {id:1,title:'<i>周会</i>',status:'running',progress:'正在总结',result:null,error:'',seen:false};
+
+test('a running task shows progress as plain text, can be cancelled, and the panel keeps polling',async()=>{
+  const page=taskPage([{tasks:[RUNNING]}]);
+  await tick();
+  const row=page.get('taskList').children[0], head=row.children[0];
+  assert.equal(head.children[0].textContent,'<i>周会</i>');
+  assert.equal(head.children[1].textContent,'进行中');
+  assert.equal(row.children[1].textContent,'正在总结');
+  assert.deepEqual(page.timers,[3000]);
+  await head.children[2].onclick();
+  assert.deepEqual(page.calls.find(call=>call[0]==='POST'),['POST','/api/tasks/1/cancel']);
+});
+
+test('a task that finished is announced once and marked seen, and polling stops',async()=>{
+  const page=taskPage([{tasks:[{...RUNNING,status:'done',progress:'',result:{text:'定了下周发布'}}]}]);
+  await tick();
+  assert.match(page.get('status').textContent,/后台任务完成：<i>周会<\/i>/);
+  assert.deepEqual(page.calls.find(call=>call[0]==='POST'),['POST','/api/tasks/1/seen']);
+  assert.equal(page.get('taskList').children[0].children[1].textContent,'定了下周发布');
+  assert.deepEqual(page.timers,[]);
+  const failed=taskPage([{tasks:[{...RUNNING,status:'failed',error:'今天的花费已到上限',seen:true}]}]);
+  await tick();
+  assert.equal(failed.get('status').textContent,'');
+  assert.equal(failed.get('taskList').children[0].children[1].textContent,'今天的花费已到上限');
+});

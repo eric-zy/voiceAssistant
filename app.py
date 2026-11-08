@@ -33,6 +33,7 @@ from audio_codec import OpusDecoder, to_ogg_opus
 from memory_store import ActionLog  # noqa: F401  (tests build per-user logs through app)
 import tools as agent_tools
 from tools import default_registry
+import agents
 import usage
 import user_context
 from urllib.parse import urlsplit
@@ -102,10 +103,19 @@ PCM_BYTES_PER_SECOND = 32000
 CLONE_BUSY_WAIT_SECONDS = 10
 REMINDER_POLL_SECONDS = 5
 latency_log = logging.getLogger("uvicorn.error")
+def agent_chat(model, messages, on_usage=None, **options):
+    """How background agents reach the model; looked up at call time so configuration changes apply."""
+    return stream_chat(DEEPSEEK_URL, API_KEY, model, messages, on_usage=on_usage, **options)
+
+
+task_runner = agents.TaskRunner(agent_chat, lambda: LLM_MODEL)
+
+
 @contextlib.asynccontextmanager
 async def lifespan(application):
     with disconnect_logging(asyncio.get_running_loop()):
         yield
+        await task_runner.shutdown()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -580,6 +590,55 @@ async def delete_document(request: Request, name: str):
         raise HTTPException(404, "没有这个文件")
     context.action_log.record("delete_document", {"name": name}, "page", "executed")
     return {"ok": True}
+
+
+class TaskRequest(BaseModel):
+    kind: str
+    title: str = ""
+    input: dict = {}
+
+
+@app.get("/api/tasks")
+async def list_tasks(request: Request):
+    context = require_user(request)
+    return {"tasks": await asyncio.to_thread(context.tasks.recent), "kinds": sorted(agents.FEATURES)}
+
+
+@app.post("/api/tasks")
+async def submit_task(request: Request, body: TaskRequest):
+    context = require_user(request, write=True)
+    if len(json.dumps(body.input, ensure_ascii=False)) > agents.MAX_INPUT_CHARS:
+        raise HTTPException(413, "内容太长")
+    if not API_KEY:
+        raise HTTPException(400, "请设置 DEEPSEEK_API_KEY 环境变量后重启后端")
+    try:
+        task_id = task_runner.submit(context, body.kind, body.title, body.input)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    except agents.AgentStopped as error:
+        raise HTTPException(429, str(error)) from error
+    return {"id": task_id}
+
+
+@app.get("/api/tasks/{task_id}")
+async def get_task(request: Request, task_id: int):
+    context = require_user(request)
+    task = await asyncio.to_thread(context.tasks.get, task_id)
+    if task is None:
+        raise HTTPException(404, "没有这个任务")
+    return task
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+async def cancel_task(request: Request, task_id: int):
+    context = require_user(request, write=True)
+    return {"cancelled": task_runner.cancel(context, task_id)}
+
+
+@app.post("/api/tasks/{task_id}/seen")
+async def task_seen(request: Request, task_id: int):
+    context = require_user(request, write=True)
+    return {"ok": await asyncio.to_thread(context.tasks.mark_seen, task_id)}
 
 
 @app.get("/api/reminders")
