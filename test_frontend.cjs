@@ -3,56 +3,6 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const fs = require('node:fs');
 
-function setup(busy=false) {
-  const elements = new Map();
-  const get = id => {
-    if (!elements.has(id)) elements.set(id, {textContent:'',value:'',disabled:false,replaceChildren(){},append(){}});
-    return elements.get(id);
-  };
-  let requested, previewCalls=0;
-  const entered = new Promise(resolve => requested=resolve);
-  const state = {profiles:[],provider:'cosyvoice',profile_id:'test',clone_service_ready:true,clone_service_busy:busy,clone_device:'cpu'};
-  const context = {$:get,document:{createElement:()=>({})},WebSocket:{OPEN:1},ws:{readyState:1},
-    requestId:0,playing:new Set(),closeRecording(){},refreshHealth:async()=>{},unlockAudio:async()=>{},
-    AbortController,setTimeout,clearTimeout,setInterval,clearInterval,console};
-  context.window=context;
-  context.nextTurn=()=>{context.requestId++;context.voicePreviewController?.abort();return context.requestId;};
-  context.fetch=async(url,options={})=>{
-    if(url==='/api/voices') return {ok:true,json:async()=>state};
-    if(url==='/api/voice/preview') {
-      previewCalls++; requested();
-      return new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>reject(new DOMException('aborted','AbortError')),{once:true}));
-    }
-    throw Error('Unexpected URL');
-  };
-  vm.createContext(context);
-  vm.runInContext(fs.readFileSync(__dirname+'/static/voices.js','utf8'),context);
-  return {get,context,entered,calls:()=>previewCalls};
-}
-
-test('preview shows progress and cancellation clears the wait',async()=>{
-  const ui=setup();
-  await new Promise(resolve=>setImmediate(resolve));
-  const pending=ui.get('previewVoice').onclick();
-  await ui.entered;
-  assert.match(ui.get('voiceStatus').textContent,/正在合成试听/);
-  assert.equal(ui.get('previewVoice').disabled,true);
-  ui.get('cancelVoice').onclick();
-  await pending;
-  assert.match(ui.get('voiceStatus').textContent,/试听已停止/);
-  assert.equal(ui.get('previewVoice').disabled,false);
-});
-
-test('busy service is visible and does not start another preview',async()=>{
-  const ui=setup(true);
-  await new Promise(resolve=>setImmediate(resolve));
-  await ui.get('previewVoice').onclick();
-  assert.match(ui.get('voiceStatus').textContent,/上一条合成仍在运行/);
-  assert.equal(ui.calls(),0);
-  assert.equal(ui.get('previewVoice').disabled,false);
-  assert.equal(ui.get('cancelVoice').disabled,true);
-});
-
 test('streamed audio keeps order and stale decoded audio cannot play after interruption',async()=>{
   const elements = new Map();
   const get = id => {
@@ -372,115 +322,10 @@ test('a reply whose speech failed still ends with a status saying so',()=>{
   assert.match(page.get('status').textContent,/回复完成；/);
 });
 
-function memoryPage(list=[]) {
-  const elements = new Map(), calls = [];
-  const get = id => {
-    if (!elements.has(id)) elements.set(id,{textContent:'',hidden:true,children:[],replaceChildren(...items){this.children=items;}});
-    return elements.get(id);
-  };
-  const create = () => ({style:{},textContent:'',append(...items){this.children=items;}});
-  const context = {$:get,document:{createElement:create},status(text){get('status').textContent=text;},console,
-    fetch:async(url,options={})=>{calls.push([options.method||'GET',url]);return {ok:true,json:async()=>({memories:list})};}};
-  context.window=context;
-  vm.createContext(context);
-  vm.runInContext(fs.readFileSync(__dirname+'/static/memories.js','utf8'),context);
-  return {get,context,calls};
-}
-
-test('memories are listed as plain text and an empty list shows the hint',async()=>{
-  const page=memoryPage([{id:3,content:'<b>不吃香菜</b>'}]);
-  await tick();
-  assert.equal(page.get('memoryEmpty').hidden,true);
-  assert.equal(page.get('memoryList').children[0].children[0].textContent,'<b>不吃香菜</b>');
-  const empty=memoryPage([]);
-  await tick();
-  assert.equal(empty.get('memoryEmpty').hidden,false);
-});
-
-test('a new memory offers undo, and undo deletes it then hides the bar',async()=>{
-  const page=memoryPage();
-  page.context.memoryChanged({text:'记住了：不吃香菜',undo:{action:'delete',id:3}});
-  assert.equal(page.get('undoBox').hidden,false);
-  assert.equal(page.get('undoText').textContent,'记住了：不吃香菜');
-  await page.get('undoButton').onclick();
-  assert.deepEqual(page.calls.find(call=>call[0]==='DELETE'),['DELETE','/api/memories/3']);
-  assert.equal(page.get('undoBox').hidden,true);
-});
-
-test('undoing a forget restores it',async()=>{
-  const page=memoryPage();
-  page.context.memoryChanged({text:'已经忘掉：不吃香菜',undo:{action:'restore',id:3}});
-  await page.get('undoButton').onclick();
-  assert.deepEqual(page.calls.find(call=>call[0]==='POST'),['POST','/api/memories/3/restore']);
-});
-
-test('clearing has nothing to undo',()=>{
-  const page=memoryPage();
-  page.context.memoryChanged({text:'已清空全部记忆',undo:null});
-  assert.equal(page.get('undoBox').hidden,true);
-});
-
 test('a due reminder starts a new turn and asks to announce it',()=>{
   const page=confirmPage();
   page.receive({type:'reminder_due',request_id:null,reminder_id:7});
   assert.deepEqual(page.sent.slice(-2),[{type:'interrupt',request_id:1},{type:'announce',request_id:1,reminder_id:7}]);
-});
-
-test('reminders are listed with their time and can be cancelled then restored',async()=>{
-  const page=memoryPage();
-  page.context.fetch=async(url,options={})=>{page.calls.push([options.method||'GET',url]);
-    return {ok:true,json:async()=>url==='/api/reminders'?{reminders:[{id:2,content:'开会',due_at:'2026-11-07T15:00:00'}]}:{memories:[]}};};
-  await page.context.refreshReminders();
-  assert.equal(page.get('reminderEmpty').hidden,true);
-  const row=page.get('reminderList').children[0];
-  assert.equal(row.children[0].textContent,'2026-11-07 15:00:00 开会');
-  await row.children[1].onclick();
-  assert.deepEqual(page.calls.find(call=>call[0]==='DELETE'),['DELETE','/api/reminders/2']);
-  await page.get('undoButton').onclick();
-  assert.deepEqual(page.calls.find(call=>call[0]==='POST'),['POST','/api/reminders/2/restore']);
-});
-
-function libraryPage(files, responses=[]) {
-  const page=memoryPage();
-  page.context.encodeURIComponent=encodeURIComponent;
-  page.context.FormData=class{append(){}};
-  page.context.fetch=async(url,options={})=>{page.calls.push([options.method||'GET',url]);
-    const next=options.method?responses.shift():null;
-    return next||{ok:true,json:async()=>url==='/api/knowledge'?{files}:{memories:[]}};};
-  return page;
-}
-
-test('documents show how much text was found, or that none was',async()=>{
-  const page=libraryPage([{name:'a.pdf',chunks:3},{name:'scan.pdf',chunks:0}]);
-  await page.context.refreshKnowledge();
-  const rows=page.get('knowledgeList').children;
-  assert.equal(rows[0].children[0].textContent,'a.pdf（3 段）');
-  assert.match(rows[1].children[0].textContent,/未提取到文字/);
-});
-
-test('deleting a document asks first, and declining sends nothing',async()=>{
-  const page=libraryPage([{name:'子 目录/a.md',chunks:1}]);
-  await page.context.refreshKnowledge();
-  page.context.confirm=()=>false;
-  await page.get('knowledgeList').children[0].children[1].onclick();
-  assert.equal(page.calls.some(call=>call[0]==='DELETE'),false);
-  page.context.confirm=()=>true;
-  await page.get('knowledgeList').children[0].children[1].onclick();
-  assert.deepEqual(page.calls.find(call=>call[0]==='DELETE'),['DELETE','/api/knowledge/%E5%AD%90%20%E7%9B%AE%E5%BD%95/a.md']);
-});
-
-test('an upload reports the result and clears the picker',async()=>{
-  const page=libraryPage([],[{ok:true,json:async()=>({name:'a.pdf',chunks:0})}]);
-  const input={files:[{name:'a.pdf'}],value:'x'};
-  await page.get('knowledgeFile').onchange({target:input});
-  assert.match(page.get('status').textContent,/没有提取到文字/);
-  assert.equal(input.value,'');
-});
-
-test('a refused upload shows why',async()=>{
-  const page=libraryPage([],[{ok:false,json:async()=>({detail:'只支持 md、txt、pdf、docx 文件'})}]);
-  await page.get('knowledgeFile').onchange({target:{files:[{name:'a.exe'}],value:'x'}});
-  assert.match(page.get('status').textContent,/只支持/);
 });
 
 function speechHelpers() {
@@ -543,214 +388,328 @@ test('the page announces whether it can play Ogg/Opus when it connects', () => {
   assert.deepEqual(page.messages().find(m => m.type === 'client'), {type:'client', audio:['ogg-opus']});
 });
 
-function usagePage(data) {
+
+// The React pages: no DOM renderer in node, so these load the page scripts with a stand-in React and test what
+// the pages are built from (their logic, the voice flows, the toasts, the task poller, the live English dock).
+const plain = value => JSON.parse(JSON.stringify(value));  // values from another vm context
+function uiContext(files, extra={}) {
+  const calls = [], timers = [];
+  const React = {createElement:(type,props,...children)=>({type,props,children}), Fragment:'Fragment',
+    useState(){throw Error('not rendering')}, useEffect(){}, useRef(){return {}}, useMemo(f){return f()}, useCallback(f){return f}};
+  const node = tag => {
+    const n = {tag,style:{},textContent:'',children:[],value:'',className:'',type:'',
+      append(...items){for (const item of items) { item.parent = this; this.children.push(item); }},
+      insertBefore(item, ref){item.parent = this; const i = ref ? this.children.indexOf(ref) : -1; if (i < 0) this.children.push(item); else this.children.splice(i, 0, item);},
+      querySelector(sel){return this.querySelectorAll(sel)[0] || null;},
+      querySelectorAll(sel){const out=[];const visit=x=>{for(const c of x.children||[]){if(sel.startsWith('.')&&String(c.className).split(' ').includes(sel.slice(1)))out.push(c);visit(c);}};visit(this);return out;},
+      get parentElement(){ return this.parent || null; },
+      get nextSibling(){ const list = this.parent?.children || []; return list[list.indexOf(this) + 1] || null; },
+      setAttribute(name, value){ this[name] = value; },
+      replaceChildren(...items){ this.children = []; this.append(...items); },
+      remove(){ if (this.parent) this.parent.children = this.parent.children.filter(c => c !== this); },
+      get nextElementSibling(){ const list = this.parent?.children || []; return list[list.indexOf(this) + 1] || null; }};
+    return n;
+  };
   const elements = new Map();
-  const get = id => {
-    if (!elements.has(id)) elements.set(id,{textContent:'',open:false,children:[],listeners:{},
-      addEventListener(name,fn){this.listeners[name]=fn;},replaceChildren(...items){this.children=items;}});
-    return elements.get(id);
-  };
-  const cell = () => ({textContent:'',style:{}});
-  const create = tag => tag==='table'
-    ? {style:{},rows:[],insertRow(){const row={cells:[],insertCell(){const c=cell();this.cells.push(c);return c;},append(c){this.cells.push(c);}};this.rows.push(row);return row;}}
-    : cell();
-  const context = {$:get,document:{createElement:create},console,fetch:async()=>({ok:true,json:async()=>data})};
-  vm.createContext(context);
-  vm.runInContext(fs.readFileSync(__dirname+'/static/usage.js','utf8'),context);
-  return {get,context};
-}
-const TOTALS = {calls:3,yuan:0.000123,hit_tokens:800,miss_tokens:200,output_tokens:50,searches:1,incomplete:1,unpriced:0,cache_rate:0.8};
-
-test('the spend panel loads when opened and shows money, cache rate and missing calls',async()=>{
-  const page=usagePage({today:TOTALS,month:{...TOTALS,yuan:1.5},days:[{day:'2026-11-08',...TOTALS}],agents:[{agent:'main',...TOTALS}]});
-  page.get('usagePanel').open=true; page.get('usagePanel').listeners.toggle();
-  await tick();
-  const text=page.get('usageBody').children.map(child=>child.textContent||'').join('\n');
-  assert.match(text,/今天：¥0\.0001 · 2 次对话 · 1 次搜索/);
-  assert.match(text,/本月：¥1\.50/);
-  assert.match(text,/缓存命中 80%/);
-  assert.match(text,/1 次被打断的对话没有拿到用量/);
-  assert.equal(page.get('usageBody').children.filter(child=>child.rows).length,2);
-});
-
-test('only an admin response adds the per-account table, written as plain text',async()=>{
-  const page=usagePage({today:TOTALS,month:TOTALS,days:[],agents:[],all:{month:TOTALS,users:[{email:'<b>x</b>@a.test',...TOTALS}]}});
-  await page.get('usageRefresh').onclick();
-  await tick();
-  const tables=page.get('usageBody').children.filter(child=>child.rows);
-  assert.equal(tables.length,1);
-  assert.equal(tables[0].rows[1].cells[0].textContent,'<b>x</b>@a.test');
-});
-
-function taskPage(responses) {
-  const elements = new Map(), calls = [], timers = [];
-  const get = id => {
-    if (!elements.has(id)) elements.set(id,{textContent:'',hidden:false,open:false,children:[],style:{},replaceChildren(...items){this.children=items;}});
-    return elements.get(id);
-  };
-  const create = () => ({style:{},textContent:'',children:[],append(...items){this.children.push(...items);}});
-  let index = 0;
-  const context = {$:get,document:{createElement:create},console,status(text){get('status').textContent=text;},
-    setTimeout:(fn,ms)=>{timers.push(ms);return timers.length;},clearTimeout(){},
-    fetch:async(url,options={})=>{calls.push([options.method||'GET',url]);
-      const body=url==='/api/tasks'&&!options.method?responses[Math.min(index++,responses.length-1)]:{};
-      return {ok:true,json:async()=>body};}};
-  vm.createContext(context);
-  vm.runInContext(fs.readFileSync(__dirname+'/static/tasks.js','utf8'),context);
-  return {get,context,calls,timers};
-}
-const RUNNING = {id:1,title:'<i>周会</i>',status:'running',progress:'正在总结',result:null,error:'',seen:false};
-
-test('a running task shows progress as plain text, can be cancelled, and the panel keeps polling',async()=>{
-  const page=taskPage([{tasks:[RUNNING]}]);
-  await tick();
-  const row=page.get('taskList').children[0], head=row.children[0];
-  assert.equal(head.children[0].textContent,'<i>周会</i>');
-  assert.equal(head.children[1].textContent,'进行中');
-  assert.equal(row.children[1].textContent,'正在总结');
-  assert.deepEqual(page.timers,[3000]);
-  await head.children[2].onclick();
-  assert.deepEqual(page.calls.find(call=>call[0]==='POST'),['POST','/api/tasks/1/cancel']);
-});
-
-test('a task that finished is announced once and marked seen, and polling stops',async()=>{
-  const page=taskPage([{tasks:[{...RUNNING,status:'done',progress:'',result:{text:'定了下周发布'}}]}]);
-  await tick();
-  assert.match(page.get('status').textContent,/后台任务完成：<i>周会<\/i>/);
-  assert.deepEqual(page.calls.find(call=>call[0]==='POST'),['POST','/api/tasks/1/seen']);
-  assert.equal(page.get('taskList').children[0].children[1].textContent,'定了下周发布');
-  assert.deepEqual(page.timers,[]);
-  const failed=taskPage([{tasks:[{...RUNNING,status:'failed',error:'今天的花费已到上限',seen:true}]}]);
-  await tick();
-  assert.equal(failed.get('status').textContent,'');
-  assert.equal(failed.get('taskList').children[0].children[1].textContent,'今天的花费已到上限');
-});
-
-function meetingPage(tasks, replies={}) {
-  const elements = new Map(), calls = [];
-  const node = (tag) => ({tag,style:{},textContent:'',children:[],files:[],value:'',checked:false,disabled:false,open:false,hidden:false,
-    append(...items){this.children.push(...items);},replaceChildren(...items){this.children=items;}});
-  const get = id => { if (!elements.has(id)) elements.set(id,node('div')); return elements.get(id); };
-  const context = {$:get,document:{createElement:node},console,status(text){get('status').textContent=text;},
-    setTimeout:()=>0,clearTimeout(){},confirm:()=>true,FormData:class{constructor(){this.parts=[];}append(k,v){this.parts.push([k,v]);}},
-    refreshPanels(){calls.push(['refreshPanels']);},
+  const $ = id => { if (!elements.has(id)) elements.set(id, node('div')); return elements.get(id); };
+  const context = {React, console, EventTarget, CustomEvent, AbortController, FormData:class{constructor(){this.parts=[];}append(k,v){this.parts.push([k,v]);}},
+    location:{hash:'',replace(){}}, addEventListener(){}, document:{createElement:node},
+    setTimeout:(fn,ms)=>{timers.push({fn,ms});return timers.length;}, clearTimeout(){}, setInterval:()=>0, clearInterval(){},
+    $, confirm:()=>true,
     fetch:async(url,options={})=>{calls.push([options.method||'GET',url,options.body]);
-      const body = url==='/api/tasks' && !options.method ? {tasks} : (replies[url] || {});
-      return {ok:!body.detail,json:async()=>body};}};
+      const body = (extra.replies||{})[url] ?? {};
+      return {ok:!body.detail,status:200,json:async()=>body};},
+    ...extra.globals};
+  context.window = context;
   vm.createContext(context);
-  vm.runInContext(fs.readFileSync(__dirname+'/static/tasks.js','utf8'),context);
-  vm.runInContext(fs.readFileSync(__dirname+'/static/meetings.js','utf8'),context);
-  return {get,context,calls};
+  for (const file of ['core.js', ...files]) vm.runInContext(fs.readFileSync(__dirname+'/static/ui/'+file,'utf8'),context);
+  const run = code => vm.runInContext(code, context);
+  return {context, calls, timers, node, $, run, UI: context.UI};
 }
-const MEETING = {id:7,kind:'meeting_notes',title:'周会',status:'done',progress:'',error:'',seen:true,result:{
-  text:'结论：周五发布', file:'ab.wav', transcript:[{start:65,end:70,text:'<b>周五</b>发布'}],
-  proposals:[{task:'写发布说明',owner:'小王',due_text:'周四之前',due_at:'2099-01-01T18:00:00'},{task:'想想',owner:'',due_text:'',due_at:''}]}};
-function walk(node, out=[]) { out.push(node); for (const child of node.children||[]) walk(child, out); return out; }
 
-test('a finished meeting shows notes, ticked to-dos with editable times, and the transcript as text',async()=>{
-  const page=meetingPage([MEETING]);
-  await tick();
-  const all=walk(page.get('taskList'));
-  assert.ok(all.some(n=>n.textContent==='结论：周五发布'));
-  assert.ok(all.some(n=>n.textContent==='[01:05] <b>周五</b>发布'));
-  const boxes=all.filter(n=>n.type==='checkbox'), times=all.filter(n=>n.type==='datetime-local');
-  assert.deepEqual(boxes.map(b=>b.checked),[true,false]);
-  assert.equal(times[0].value,'2099-01-01T18:00');
+test('the menu groups pages in a fixed order and sorts each group',()=>{
+  const ui=uiContext(['pages.js','voices.js','meetings.js','audio.js','english.js']);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/ui/shell.js','utf8').split('ReactDOM.createRoot')[0],ui.context);
+  const menu=plain(ui.UI.logic.menu(ui.UI.pages).map(s=>[s.group,s.pages.map(p=>p.title)]));
+  assert.deepEqual(menu,[['助手',['对话','音色']],['我的资料',['长期记忆','待办提醒','知识库']],
+    ['智能体',['会议记录','有声内容','英语对话','后台任务']],['账户',['花费','设置']]]);
 });
 
-test('only ticked to-dos are sent, with the time as edited, and the panels refresh',async()=>{
-  const page=meetingPage([MEETING],{'/api/meetings/reminders':{created:[3],problems:[]}});
-  await tick();
-  const all=walk(page.get('taskList'));
-  all.filter(n=>n.type==='datetime-local')[0].value='2099-02-02T09:30';
-  await all.find(n=>n.textContent==='把勾选的建为提醒').onclick();
-  const sent=page.calls.find(call=>call[1]==='/api/meetings/reminders');
-  assert.deepEqual(JSON.parse(sent[2]),{items:[{task:'写发布说明',due_at:'2099-02-02T09:30:00'}]});
-  assert.ok(all.some(n=>n.textContent==='已建 1 条提醒'));
-  assert.ok(page.calls.some(call=>call[0]==='refreshPanels'));
+test('formatting: money, tokens, clocks and times',()=>{
+  const {format}=uiContext([]).UI.logic;
+  assert.equal(format.yuan(0.000123),'¥0.0001'); assert.equal(format.yuan(1.5),'¥1.50'); assert.equal(format.yuan(0),'¥0.00');
+  assert.equal(format.tokens(12345),'1.2万'); assert.equal(format.tokens(999),'999');
+  assert.equal(format.clock(65),'01:05'); assert.equal(format.clock(3725),'01:02:05');
+  assert.equal(format.when('2026-11-08T10:00:00+0800'),'2026-11-08 10:00');
 });
 
-test('deleting the recording asks first and archiving reports the file name',async()=>{
-  const page=meetingPage([MEETING],{'/api/meetings/archive':{name:'会议纪要-周会.md'}});
-  await tick();
-  const all=walk(page.get('taskList'));
-  page.context.confirm=()=>false;
-  await all.find(n=>n.textContent==='删除录音').onclick();
-  assert.equal(page.calls.some(call=>call[0]==='DELETE'),false);
-  page.context.confirm=()=>true;
-  await all.find(n=>n.textContent==='删除录音').onclick();
-  assert.deepEqual(page.calls.find(call=>call[0]==='DELETE').slice(0,2),['DELETE','/api/meetings/ab.wav']);
-  await all.find(n=>n.textContent==='存进知识库').onclick();
-  await tick();
-  assert.ok(all.some(n=>n.textContent==='已存进知识库：会议纪要-周会.md'));
+test('a voice command that changed memories offers undo, and undo restores and refreshes',async()=>{
+  const ui=uiContext(['pages.js']);
+  let changed=0; ui.run("bus.addEventListener('data-changed',()=>{window.changed=(window.changed||0)+1})");
+  ui.context.memoryChanged({text:'已经忘掉：不吃香菜',undo:{action:'restore',id:3}});
+  const [item]=ui.run('toasts.get().items');
+  assert.equal(item.text,'已经忘掉：不吃香菜'); assert.equal(item.action.label,'撤销');
+  item.action.run(); await new Promise(r=>setImmediate(r));
+  assert.deepEqual(ui.calls.at(-1).slice(0,2),['POST','/api/memories/3/restore']);
+  assert.equal(ui.context.changed,2);
+  ui.context.memoryChanged({text:'已清空全部记忆',undo:null});
+  assert.equal(ui.run('toasts.get().items').at(-1).action,null);
 });
 
-test('uploading needs a file, sends it with the date, and opens the tasks panel',async()=>{
-  const page=meetingPage([],{'/api/meetings':{id:1}});
-  await page.get('meetingUpload').onclick();
-  assert.equal(page.get('meetingStatus').textContent,'请先选择录音文件');
-  page.get('meetingFile').files=[{name:'周会.m4a'}]; page.get('meetingDate').value='2026-11-09';
-  await page.get('meetingUpload').onclick();
-  const sent=page.calls.find(call=>call[1]==='/api/meetings');
-  assert.deepEqual(sent[2].parts,[['file',{name:'周会.m4a'}],['date','2026-11-09']]);
-  assert.equal(page.get('taskPanel').open,true);
-  assert.match(page.get('meetingStatus').textContent,/已开始处理/);
+test('cancelling a reminder by undo uses the reminder address',async()=>{
+  const ui=uiContext(['pages.js']);
+  await ui.run("changeItem({kind:'reminder',action:'delete',id:4})");
+  assert.deepEqual(ui.calls.at(-1).slice(0,2),['DELETE','/api/reminders/4']);
 });
 
-function audioPage(tasks, replies={}) {
-  const elements = new Map(), calls = [];
-  const node = (tag) => ({tag,style:{},textContent:'',children:[],files:[],value:'',checked:false,disabled:false,open:false,hidden:false,
-    append(...items){this.children.push(...items);},replaceChildren(...items){this.children=items;},removeAttribute(name){delete this[name];}});
-  const get = id => { if (!elements.has(id)) elements.set(id,node('div')); return elements.get(id); };
-  const context = {$:get,document:{createElement:node},console,status(text){get('status').textContent=text;},
-    setTimeout:()=>0,clearTimeout(){},confirm:()=>true,
-    fetch:async(url,options={})=>{calls.push([options.method||'GET',url,options.body]);
-      const body = url==='/api/tasks' && !options.method ? {tasks} : (replies[url] || {});
-      return {ok:!body.detail,json:async()=>body};}};
-  vm.createContext(context);
-  vm.runInContext(fs.readFileSync(__dirname+'/static/tasks.js','utf8'),context);
-  vm.runInContext(fs.readFileSync(__dirname+'/static/audio.js','utf8'),context);
-  return {get,context,calls};
+test('service status reads as labelled lines',()=>{
+  const lines=uiContext(['pages.js']).UI.logic.healthLines({asr_provider:'sensevoice',asr_ready:true,llm_model:'deepseek-flash',api_key_configured:false,
+    tts_provider:'edge',tts_voice:'晓晓',tts_rate:'+0%',tools:['get_weather']});
+  assert.deepEqual(plain(lines.map(l=>l[0])),['语音识别','DeepSeek','语音播报','可用工具']);
+  assert.match(lines[1][1],/请设置 DEEPSEEK_API_KEY/); assert.match(lines[2][1],/语速 \+0%/);
+});
+
+test('spending tables and the notes about missing or unpriced calls',()=>{
+  const {usageRows,usageNotes}=uiContext(['pages.js']).UI.logic;
+  const totals={calls:3,yuan:0.000123,hit_tokens:800,miss_tokens:200,output_tokens:50,searches:1,incomplete:1,unpriced:0};
+  assert.deepEqual(plain(usageRows([{agent:'tutor',...totals}],'agent')),[['tutor','¥0.0001','2','1','1050']]);
+  assert.deepEqual(plain(usageNotes(totals)),['1 次被打断的对话没有拿到用量，实际花费会略高']);
+  assert.deepEqual(plain(usageNotes({...totals,incomplete:0})),[]);
+});
+
+test('a finished task is announced once and marked seen; a running one keeps the poller going',async()=>{
+  const running={id:1,title:'周会',status:'running',progress:'正在转写',seen:false};
+  const ui=uiContext([],{replies:{'/api/tasks':{tasks:[running,{id:2,title:'兔子',status:'done',seen:false,result:{text:'好'}}],kinds:[]}}});
+  await ui.UI.refreshTasks();
+  assert.deepEqual(plain(ui.run('toasts.get().items').map(t=>t.text)),['后台任务完成：兔子']);
+  assert.ok(ui.calls.some(c=>c[1]==='/api/tasks/2/seen'));
+  assert.equal(ui.timers.at(-1).ms,3000);
+  const {taskPreview}=ui.UI.logic;
+  assert.equal(taskPreview(running),'正在转写');
+  assert.equal(taskPreview({status:'failed',error:'超时'}),'超时');
+  assert.equal(taskPreview({status:'done',result:{text:'x'.repeat(300)}}).length,200);
+});
+
+test('only ticked to-dos become reminders, with the time as edited',()=>{
+  const {reminderItems}=uiContext(['meetings.js']).UI.logic;
+  assert.deepEqual(plain(reminderItems([{task:'写说明',ticked:true,when:'2099-02-02T09:30'},{task:'想想',ticked:false,when:''},{task:'无时间',ticked:true,when:''}])),
+    [{task:'写说明',due_at:'2099-02-02T09:30:00'},{task:'无时间',due_at:''}]);
+});
+
+test('script length and audio size read naturally',()=>{
+  const {scriptLength,audioInfo}=uiContext(['audio.js']).UI.logic;
+  assert.equal(scriptLength('字'.repeat(600)),'600 字，约 2 分钟'); assert.equal(scriptLength('短'),'1 字，约 1 分钟');
+  assert.equal(audioInfo({seconds:75,bytes:1048576}),'1 分 15 秒 · 1.0 MB');
+});
+
+function voiceUi(busy=false) {
+  let requested, previewCalls=0;
+  const entered=new Promise(resolve=>requested=resolve);
+  const state={profiles:[{id:'me',name:'我的声音'}],provider:'cosyvoice',profile_id:'me',clone_service_ready:true,clone_service_busy:busy,clone_device:'cpu'};
+  const globals={WebSocket:{OPEN:1},ws:{readyState:1},requestId:0,playing:new Set(),closeRecording(){},unlockAudio:async()=>{}};
+  const ui=uiContext(['pages.js','voices.js'],{globals});
+  ui.context.nextTurn=()=>{ui.context.requestId++;ui.context.voicePreviewController?.abort();return ui.context.requestId;};
+  vm.runInContext('var requestId=0',ui.context);
+  ui.context.nextTurn=()=>{vm.runInContext('requestId++',ui.context);ui.context.voicePreviewController?.abort();return vm.runInContext('requestId',ui.context);};
+  ui.context.setInterval=setInterval; ui.context.clearInterval=clearInterval; ui.context.setTimeout=setTimeout; ui.context.clearTimeout=clearTimeout;
+  ui.context.fetch=async(url,options={})=>{
+    if(url==='/api/voices') return {ok:true,json:async()=>state};
+    if(url==='/api/voice/preview'){previewCalls++;requested();
+      return new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>reject(new DOMException('aborted','AbortError')),{once:true}));}
+    throw Error('Unexpected URL '+url);
+  };
+  const seen={status:'',previewing:false,cancellable:false,choices:[],value:''};
+  const actions=ui.UI.logic.createVoiceActions({status:t=>seen.status=t,selected:()=>seen.value,setPreviewing:v=>seen.previewing=v,
+    setCancellable:v=>seen.cancellable=v,setUploading(){},setChoices:(list,value)=>{seen.choices=list;seen.value=value;}});
+  return {actions,seen,entered,calls:()=>previewCalls};
 }
-const SCRIPT_TASK = {id:3,kind:'audio_script',title:'兔子',status:'done',progress:'',error:'',seen:true,
-  result:{stage:'script',text:'从前有一只小兔子。',minutes:1,chars:9}};
-const AUDIO_TASK = {id:4,kind:'audio_render',title:'音频：兔子',status:'done',progress:'',error:'',seen:true,
-  result:{stage:'audio',text:'从前有一只小兔子。',audio:'ab.ogg',seconds:75,bytes:1048576}};
 
-test('a finished script can be edited and is voiced as edited',async()=>{
-  const page=audioPage([SCRIPT_TASK],{'/api/audio/render':{id:5}});
-  await tick();
-  const all=walk(page.get('taskList'));
-  const area=all.find(n=>n.tag==='textarea');
-  assert.equal(area.value,'从前有一只小兔子。');
-  area.value='从前有一只勇敢的小兔子。'; area.oninput();
-  assert.ok(all.some(n=>/^12 字，约 1 分钟/.test(n.textContent)));
-  await all.find(n=>n.textContent==='用当前音色合成').onclick();
-  assert.deepEqual(JSON.parse(page.calls.find(c=>c[1]==='/api/audio/render')[2]),{text:'从前有一只勇敢的小兔子。',title:'兔子'});
+test('voices list the clone and say whether the service is free',async()=>{
+  const ui=voiceUi();
+  await ui.actions.load();
+  assert.equal(ui.seen.value,'cosyvoice:me');
+  assert.deepEqual(plain(ui.seen.choices.at(-1)),['cosyvoice:me','我的声音 · 自定义声音']);
+  assert.match(ui.seen.status,/克隆服务：CPU · 空闲/);
 });
 
-test('finished audio plays from the server, says it is AI-made, and deleting asks first',async()=>{
-  const page=audioPage([AUDIO_TASK]);
-  await tick();
-  const all=walk(page.get('taskList'));
-  assert.equal(all.find(n=>n.tag==='audio').src,'/api/audio/ab.ogg');
-  assert.ok(all.some(n=>n.textContent==='1 分 15 秒 · 1.0 MB · 开头有“本内容由 AI 合成”提示'));
-  assert.equal(all.find(n=>n.tag==='a').download,'音频：兔子.ogg');
-  page.context.confirm=()=>false;
-  await all.find(n=>n.textContent==='删除音频').onclick();
-  assert.equal(page.calls.some(c=>c[0]==='DELETE'),false);
-  page.context.confirm=()=>true;
-  await all.find(n=>n.textContent==='删除音频').onclick();
-  assert.deepEqual(page.calls.find(c=>c[0]==='DELETE').slice(0,2),['DELETE','/api/audio/ab.ogg']);
+test('preview shows progress and cancellation clears the wait',async()=>{
+  const ui=voiceUi();
+  const pending=ui.actions.preview();
+  await ui.entered;
+  assert.match(ui.seen.status,/正在合成试听/);
+  assert.equal(ui.seen.previewing,true);
+  ui.actions.cancel();
+  await pending;
+  assert.match(ui.seen.status,/试听已(停止|取消)/);
+  assert.equal(ui.seen.previewing,false);
 });
 
-test('starting needs a topic and sends review as no render',async()=>{
-  const page=audioPage([],{'/api/audio/scripts':{id:1}});
-  await page.get('audioStart').onclick();
-  assert.equal(page.get('audioStatus').textContent,'请写一下主题');
-  Object.assign(page.get('audioTopic'),{value:'勇气'}); page.get('audioMinutes').value='5';
-  page.get('audioStyle').value='温柔'; page.get('audioReview').checked=true; page.get('audioSearch').checked=false;
-  await page.get('audioStart').onclick();
-  assert.deepEqual(JSON.parse(page.calls.find(c=>c[1]==='/api/audio/scripts')[2]),{topic:'勇气',minutes:5,style:'温柔',search:false,render:false});
-  assert.equal(page.get('taskPanel').open,true);
+test('busy service is visible and does not start another preview',async()=>{
+  const ui=voiceUi(true);
+  await ui.actions.preview();
+  assert.match(ui.seen.status,/上一条合成仍在运行/);
+  assert.equal(ui.calls(),0);
+  assert.equal(ui.seen.previewing,false);
+  assert.equal(ui.seen.cancellable,false);
+});
+
+function englishDock() {
+  const sent=[];
+  const history=[];
+  const ui=uiContext(['english.js'],{globals:{ws:{readyState:1,send:t=>sent.push(JSON.parse(t))},nextTurn:()=>9,unlockAudio:async()=>{},replyActive:false,replyBubble:null},
+    replies:{'/api/practice':{levels:[],sessions:[],counts:{},level:'intermediate'}}});
+  const bubbles=new Map();
+  ui.context.userBubbleFor=rid=>bubbles.get(rid);
+  ui.context.bubble=(role,text)=>{const box=ui.$('history');const b=ui.node('div');b.role=role;const c=ui.node('div');c.textContent=text;b.append(c);box.append(b);return c;};
+  const live=role=>{const b=ui.node('div');b.role=role;ui.$('history').append(b);return b;};
+  const state=()=>ui.run('english.get()');
+  return {ui,sent,bubbles,live,state,handle:m=>ui.UI.english.handle(m)};
+}
+const textOf = n => [n.textContent, ...(n.children||[]).map(textOf)].join(' ');
+
+test('live English: corrections go under your sentence, and redoing a sentence removes it and what came after',()=>{
+  const d=englishDock();
+  d.handle({type:'practice_started',level:'中级',topic:''});
+  assert.equal(d.state().practicing,true);
+  const opening=d.live('assistant'); d.ui.context.replyBubble={parentElement:opening};
+  d.handle({type:'practice_turn',request_id:9,turn:0,who:'tutor'});
+  const mine=d.live('user'); d.bubbles.set(12,mine);
+  d.handle({type:'practice_turn',request_id:12,turn:1,who:'learner'});
+  d.handle({type:'practice_note',request_id:12,turn:1,category:'语法',heard:'I go',original:'<b>I go</b>',corrected:'I went',better:'',explain:'过去式'});
+  assert.match(textOf(mine),/语法：<b>I go<\/b>.*→ I went.*过去式/s);
+  assert.ok(mine.children.indexOf(mine.querySelector('.practice-note')) < mine.children.indexOf(mine.querySelector('.turn-tools')));
+  d.live('assistant');
+  mine.querySelector('.practice-redo').onclick();
+  assert.deepEqual(d.sent.at(-1),{type:'practice_rewind',request_id:9,turn:1});
+  d.handle({type:'practice_rewound',request_id:9,turn:1,text:'I go to cinema'});
+  assert.deepEqual(d.ui.$('history').children,[opening]);
+  assert.equal(d.ui.$('text').value,'I go to cinema');
+  assert.match(d.state().status,/已回到这句之前/);
+});
+
+test('live English: resuming shows the earlier turns with their notes and hands back the sentence',()=>{
+  const d=englishDock();
+  d.handle({type:'practice_started',level:'初级',topic:'food',redo:'I eat it every days',
+    turns:[{who:'tutor',text:'What do you like?'},{who:'learner',text:'I like noodle'},{who:'tutor',text:'Nice!'}],
+    notes:[{turn:1,category:'语法',heard:'I like noodle',original:'noodle',corrected:'noodles',better:'',explain:'复数'}]});
+  const shown=d.ui.$('history').children;
+  assert.deepEqual(plain(shown.map(b=>b.role)),['assistant','user','assistant']);
+  assert.match(textOf(shown[1]),/→ noodles/);
+  assert.ok(shown[1].querySelector('.practice-redo'));
+  assert.equal(d.ui.$('text').value,'I eat it every days');
+  assert.match(d.state().status,/接着之前的对话（初级，food）/);
+});
+
+test('live English: ending removes the redo buttons and says where the report is',()=>{
+  const d=englishDock();
+  d.handle({type:'practice_started',level:'中级',topic:''});
+  const mine=d.live('user'); d.bubbles.set(3,mine);
+  d.handle({type:'practice_turn',request_id:3,turn:1,who:'learner'});
+  d.handle({type:'practice_stopped',task_id:5,notes:2,error:''});
+  assert.equal(mine.querySelector('.practice-redo'),null);
+  assert.equal(d.state().practicing,false);
+  assert.match(d.state().status,/2 条批注已记进错题本/);
+  d.handle({type:'practice_stopped',task_id:null,notes:0,error:'这次没有对话，不生成总结'});
+  assert.match(d.state().status,/不生成总结/);
+});
+
+test('a correction for a sentence no longer on screen shows in the status line',()=>{
+  const d=englishDock();
+  d.handle({type:'practice_note',request_id:99,turn:7,category:'用词',heard:'x',original:'',corrected:'y',better:'',explain:''});
+  assert.equal(d.state().status,'改法：x → y');
+});
+
+test('a review reads as labelled chips: pronunciation, words to practise, fluency, content',()=>{
+  const {reviewChips}=uiContext(['english.js']).UI.logic;
+  const chips=plain(reviewChips({pron:{overall:72,accuracy:65,fluency:80,completeness:100,words:[{word:'cinema',score:40},{word:'went',score:95}]},
+    fluency:{wpm:110,pauses:2,longest_pause:0.8},logic:{score:4,comment:'回答切题'}}));
+  assert.deepEqual(chips.map(c=>[c.label,c.tone]),[['发音','warn'],['要练的词','danger'],['流利度','neutral'],['内容','success']]);
+  assert.equal(chips[0].text,'72 分（准确 65 · 流利 80 · 完整 100）');
+  assert.equal(chips[1].text,'cinema（40）');
+  assert.equal(chips[2].text,'语速 110 词/分 · 停顿 2 次（最长 0.8 秒）');
+  assert.deepEqual(plain(reviewChips({pron:{error:'Key 无效'}})).map(c=>c.text),['评测失败：Key 无效']);
+  assert.deepEqual(plain(reviewChips({logic:null,fluency:null,pron:null})),[]);
+});
+
+test('live English: a spoken sentence gets a replay button and its review under it',()=>{
+  const d=englishDock();
+  d.handle({type:'practice_started',level:'中级',topic:'',session_id:7});
+  const mine=d.live('user'); d.bubbles.set(12,mine);
+  d.handle({type:'practice_turn',request_id:12,turn:1,who:'learner',audio:true});
+  const play=mine.querySelector('.practice-play');
+  assert.ok(play);
+  const played=[]; d.ui.context.Audio=function(url){played.push(url);this.play=async()=>{};this.pause=()=>{};};
+  play.onclick();
+  assert.deepEqual(played,['/api/practice/sessions/7/audio/1']);
+  d.handle({type:'practice_review',request_id:12,turn:1,logic:{score:2,comment:'没有回答问题'},fluency:null,pron:null});
+  assert.match(textOf(mine.querySelector('.practice-review')),/内容 2\/5 · 没有回答问题/);
+  const typed=d.live('user'); d.bubbles.set(13,typed);
+  d.handle({type:'practice_turn',request_id:13,turn:3,who:'learner',audio:false});
+  assert.equal(typed.querySelector('.practice-play'),null);
+  d.handle({type:'practice_review',request_id:13,turn:3,logic:null,fluency:null,pron:null});
+  assert.equal(typed.querySelector('.practice-review'),null);
+});
+
+test('a correction offers both readings of the better sentence, and plays what the server made',async()=>{
+  const d=englishDock();
+  assert.equal(d.ui.UI.logic.sayText({corrected:'I went',better:'I went to the cinema.'}),'I went to the cinema.');
+  assert.equal(d.ui.UI.logic.sayText({corrected:'I went',better:''}),'I went');
+  const card=d.ui.UI.english.noteCard({category:'语法',original:'I go',corrected:'I went',better:'I went to the cinema.',explain:''});
+  const standard=card.querySelector('.say-standard'), mine=card.querySelector('.say-mine');
+  assert.equal(standard.textContent,'▶ 标准读法'); assert.equal(mine.textContent,'▶ 我的声音');
+  const played=[];
+  d.ui.context.Audio=function(url){played.push(url);this.play=async()=>{};this.pause=()=>{};};
+  d.ui.context.URL={createObjectURL:()=> 'blob:said'};
+  d.ui.context.fetch=async(url,options)=>{d.ui.calls.push([options.method,url,options.body]);return {ok:true,blob:async()=>({})};};
+  await mine.onclick();
+  assert.deepEqual(JSON.parse(d.ui.calls.at(-1)[2]),{text:'I went to the cinema.',voice:'mine'});
+  assert.deepEqual(played,['blob:said']);
+  assert.equal(mine.textContent,'▶ 我的声音'); assert.equal(mine.disabled,false);
+});
+
+test('live English: every sentence can show its Chinese translation, fetched once and then toggled',async()=>{
+  const d=englishDock();
+  d.handle({type:'practice_started',level:'中级',topic:'',session_id:7});
+  const partner=d.live('assistant'); const label=d.ui.node('div'); const content=d.ui.node('div'); content.textContent='Oh no, that sounds rough.';
+  partner.append(label, content); d.ui.context.replyBubble=content;
+  d.handle({type:'practice_turn',request_id:9,turn:0,who:'tutor',audio:false});
+  const button=partner.querySelector('.practice-zh');
+  assert.equal(button.textContent,'译');
+  let asked=0;
+  d.ui.context.fetch=async(url,options)=>{asked++;return {ok:true,status:200,json:async()=>({text:'Oh no, that sounds rough.',zh:'哦不，听起来挺难受的。'})};};
+  await button.onclick();
+  const zh=partner.querySelector('.zh');
+  assert.equal(zh.textContent,'哦不，听起来挺难受的。'); assert.equal(button.textContent,'收起译文');
+  assert.equal(partner.children.indexOf(zh),2);  // right under the sentence, above any notes
+  await button.onclick();
+  assert.equal(zh.hidden,true); assert.equal(button.textContent,'译'); assert.equal(asked,1);
+});
+
+test('looking up a selection shows its meaning, phonetic, example and readings, and says it was saved',async()=>{
+  const d=englishDock();
+  d.ui.context.document.body=d.ui.node('body'); d.ui.context.innerWidth=1200; d.ui.context.innerHeight=800;
+  d.ui.context.fetch=async(url,options)=>({ok:true,status:200,json:async()=>({text:'rough',phonetic:'/rʌf/',meaning:'（日子）难熬的',note:'sounds rough 意思是听起来很糟',example:'I had a rough day.',kind:'word',item_id:3})});
+  await d.ui.UI.lookup.show('rough','Oh no, that sounds rough.',{left:100,bottom:200,top:180});
+  const popup=d.ui.context.document.body.children[0];
+  const text=textOf(popup);
+  assert.match(text,/rough.*\/rʌf\//s); assert.match(text,/（日子）难熬的/); assert.match(text,/I had a rough day\./); assert.match(text,/已记进生词本/);
+  assert.ok(popup.querySelector('.say-standard') && popup.querySelector('.say-mine'));
+  assert.equal(popup.style.top,'208px');
+  d.ui.UI.lookup.close();
+  assert.equal(d.ui.context.document.body.children.length,0);
+  const box=d.ui.node('div'); const who=d.ui.node('div'); const said=d.ui.node('div'); said.textContent='  I had a rough day '; box.append(who,said);
+  assert.equal(d.ui.UI.lookup.contextOf(box),'I had a rough day');
+});
+
+test('review progress and the next review read naturally, and a used review word shows in the review',()=>{
+  const {nextReviewText,scheduleText,reviewChips}=uiContext(['english.js']).UI.logic;
+  const day=86400000, iso=ms=>new Date(Date.now()+ms).toISOString().slice(0,19);
+  assert.equal(nextReviewText({mastered:true}),'已掌握，不再出题');
+  assert.equal(nextReviewText({mastered:false,due_at:iso(day)}),'明天再考');
+  assert.equal(nextReviewText({mastered:false,due_at:iso(4*day)}),'4 天后再考');
+  assert.equal(nextReviewText({mastered:false,due_at:iso(0)}),'今天还会再考');
+  assert.equal(scheduleText({mastered:0,tested:0}),'还没复习过');
+  assert.equal(scheduleText({mastered:0,tested:3,correct:2,box:2,due_at:'2026-11-12T10:00:00'}),'复习第 2 级 · 答对 2/3 · 下次 2026-11-12 10:00');
+  assert.equal(scheduleText({mastered:1}),'已掌握');
+  assert.deepEqual(plain(reviewChips({used:['rough']})),[{label:'复习词',text:'用上了 rough，算一次复习',tone:'success'}]);
 });

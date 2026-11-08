@@ -3,10 +3,12 @@ import asyncio
 import base64
 import contextlib
 from difflib import SequenceMatcher
+import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import random
 import re
 import subprocess
 import tempfile
@@ -31,12 +33,15 @@ from fillers import FillerCache, PHRASE as FILLER_PHRASE
 from llm_client import ToolCallStarted, stream_chat
 from accounts import AccountStore
 from audio_codec import OpusDecoder, to_ogg_opus
-from memory_store import ActionLog  # noqa: F401  (tests build per-user logs through app)
+from memory_store import ITEM_KINDS, ActionLog, LookupCache  # noqa: F401  (tests build per-user logs through app)
 import tools as agent_tools
 from tools import default_registry
 import agents
 import audio_content
 import meeting
+import practice
+import quiz
+import pronunciation
 import usage
 import user_context
 from urllib.parse import urlsplit
@@ -112,6 +117,7 @@ def agent_chat(model, messages, on_usage=None, **options):
 
 
 task_runner = agents.TaskRunner(agent_chat, lambda: LLM_MODEL)
+NO_TOOLS = agent_tools.ToolRegistry([])
 
 
 @contextlib.asynccontextmanager
@@ -124,7 +130,7 @@ async def lifespan(application):
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 asr_model = None
-sense_model = None
+sense_models = {}
 # Cancellation cannot stop CPU inference. A real thread lock prevents overlapping inference.
 import threading
 asr_lock = threading.Lock()
@@ -209,6 +215,9 @@ def current_voice():
     return VoiceChoice(provider, voice, saved.get("profile_id", "") if context else CLONE_ID, context.voices if context else voice_store)
 
 
+PRACTICE_VOICE = VoiceChoice("edge", practice.ENGLISH_VOICE, "", voice_store)
+
+
 def current_city():
     context = user_context.CURRENT.get(None)
     saved = context.settings() if context else {}
@@ -237,44 +246,46 @@ def keep_demo_audio(pcm):
         old.unlink()
 
 
-def transcribe(pcm: bytes) -> str:
+def transcribe(pcm: bytes, language: str = "zh") -> str:
+    """Speech to text; language is "zh" for everything except speaking practice, which passes "en"."""
     if len(pcm) % 2 or not 6400 <= len(pcm) <= MAX_BYTES:
         raise ValueError("录音应为 0.2～30 秒的 16kHz 单声道 PCM16")
     samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
     with asr_lock:
-        text = transcribe_sensevoice(pcm, samples) if ASR_PROVIDER == "sensevoice" else transcribe_whisper(samples)
+        text = transcribe_sensevoice(pcm, samples, language) if ASR_PROVIDER == "sensevoice" else transcribe_whisper(samples, language)
     # Traditional output would never match the simplified reply when filtering out the speakers.
-    return to_chinese_variant(text, "zh-cn")
+    return to_chinese_variant(text, "zh-cn") if language == "zh" else text
 
 
 meeting.TRANSCRIBE = lambda pcm: transcribe(pcm)  # looked up per call, so tests can swap it
 
 
-def transcribe_sensevoice(pcm, samples):
+def transcribe_sensevoice(pcm, samples, language="zh"):
     """SenseVoice Small via sherpa-onnx. On the webcam microphone it read 24/24 band-limited test phrases
     where Whisper base read 14/24, in a quarter of the time.
 
     It never returns nothing: silence, hum and clicks all came back as 我. Silero peaked at 0.11 or less on
     those and 0.96 or more on every real recording, so a clip below SPEECH_PEAK_MIN is treated as silence.
     """
-    global sense_model
     if not (SENSEVOICE_DIR / "model.int8.onnx").is_file():
         raise ValueError("尚未准备 SenseVoice 模型，请运行 prepare_asr.py --sensevoice")
     if measure_speech(pcm)[0] < SPEECH_PEAK_MIN:
         return ""
-    if sense_model is None:
+    if language not in sense_models:
         import sherpa_onnx
-        # Fixed to Chinese: automatic detection read short Chinese replies as Japanese.
-        sense_model = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+        # Fixed per language: automatic detection read short Chinese replies as Japanese. English keeps words
+        # as said (no "3" for "three"), which read-aloud checking compares against.
+        sense_models[language] = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=str(SENSEVOICE_DIR / "model.int8.onnx"), tokens=str(SENSEVOICE_DIR / "tokens.txt"),
-            num_threads=2, language="zh", use_itn=True)
+            num_threads=2, language=language, use_itn=language == "zh")
+    sense_model = sense_models[language]
     stream = sense_model.create_stream()
     stream.accept_waveform(16000, samples)
     sense_model.decode_stream(stream)
     return stream.result.text.strip()
 
 
-def transcribe_whisper(samples):
+def transcribe_whisper(samples, language="zh"):
     global asr_model
     if not Path(ASR_MODEL).is_dir():
         raise ValueError("尚未准备识别模型，请先运行 prepare_asr.py")
@@ -283,13 +294,29 @@ def transcribe_whisper(samples):
         asr_model = WhisperModel(ASR_MODEL, device="cpu", compute_type="int8", local_files_only=True)
     # Default retries at rising temperatures took 12 s on a 0.8 s clip of leaked playback,
     # holding asr_lock so every later sentence queued behind it. Decode once, bounded.
-    segments, _ = asr_model.transcribe(samples, language="zh", beam_size=3, vad_filter=True,
-                                       condition_on_previous_text=False, initial_prompt=SPEECH_PROMPT,
+    segments, _ = asr_model.transcribe(samples, language=language, beam_size=3, vad_filter=True,
+                                       condition_on_previous_text=False, initial_prompt=SPEECH_PROMPT if language == "zh" else None,
                                        temperature=0, max_new_tokens=300, no_repeat_ngram_size=3)
     text = "".join(segment.text for segment in segments if segment.no_speech_prob < NO_SPEECH_LIMIT).strip()
+    if language != "zh":
+        return text
     # On unclear audio Whisper repeats all or part of its prompt instead of returning nothing.
     words, prompt = re.sub(r"[\W_]+", "", to_chinese_variant(text, "zh-cn")), re.sub(r"[\W_]+", "", SPEECH_PROMPT)
     return "" if words in prompt or prompt in words else text
+
+
+def no_speech_message(pcm: bytes):
+    """Why a recording gave no text, in numbers, so a weak or wrong microphone can be told from a quiet speaker."""
+    seconds = len(pcm) / PCM_BYTES_PER_SECOND
+    if seconds < .3:
+        return f"录音只有 {seconds:.1f} 秒，按住说完整句再松开"
+    peak, _ = measure_speech(pcm)
+    samples = np.frombuffer(pcm[:len(pcm) // 2 * 2], dtype="<i2").astype(np.float32) / 32768
+    rms = float(np.sqrt(np.mean(samples ** 2))) if samples.size else 0.0
+    if peak < SPEECH_PEAK_MIN:
+        hint = "几乎没有声音，请检查选的麦克风是否正确" if rms < .002 else "有声音但不像人声（噪声或音量太小），请靠近麦克风或在“麦克风设置”里换一个"
+        return f"没听到人声（{seconds:.1f} 秒，语音概率 {peak:.2f}，需要 {SPEECH_PEAK_MIN:.2f} 以上；音量 {rms:.4f}）：{hint}"
+    return f"听到了人声但没识别出文字（语音概率 {peak:.2f}，音量 {rms:.4f}），请说慢一点、清楚一点再试"
 
 
 def analyse_microphone(pcm: bytes):
@@ -338,8 +365,8 @@ async def synthesize_clone_when_free(profile, text):
             await asyncio.sleep(.25)
 
 
-async def synthesize(text: str) -> bytes:
-    choice = current_voice()
+async def synthesize(text: str, choice=None) -> bytes:
+    choice = choice or current_voice()
     if choice.provider == "cosyvoice":
         try:
             profile = choice.store.get(choice.clone_id)
@@ -371,12 +398,12 @@ async def synthesize(text: str) -> bytes:
 audio_content.SYNTHESIZE = lambda text: synthesize(text)
 
 
-async def synthesize_parts(text):
+async def synthesize_parts(text, choice=None):
     # Short buffered segments keep up with playback on the GTX 1060; streaming
     # re-runs flow for every chunk, so it stays opt-in.
-    choice = current_voice()
+    explicit, choice = choice, choice or current_voice()
     if choice.provider != "cosyvoice" or CLONE_PLAYBACK != "stream":
-        yield await synthesize(text)
+        yield await (synthesize(text, explicit) if explicit else synthesize(text))
         return
     try:
         async with contextlib.aclosing(stream_clone(choice.store.get(choice.clone_id), text, COSYVOICE_URL)) as chunks:
@@ -547,7 +574,7 @@ async def status(request: Request):
             "tts_voice": display_voice, "tts_provider": choice.provider, "clone_playback": CLONE_PLAYBACK,
             "tts_rate": TTS_RATE, "tts_pitch": TTS_PITCH, "api_key_configured": bool(API_KEY),
             "voice_protocol": 5, "tools": list(default_registry.tools), "default_city": current_city(),
-            "email": context.email, **server}
+            "pronunciation": pronunciation.status(), "email": context.email, **server}
 
 
 @app.get("/api/memories")
@@ -731,6 +758,21 @@ class AudioRenderRequest(BaseModel):
     title: str = ""
 
 
+def numpy_concat(parts):
+    return np.concatenate(parts) if parts else np.zeros(0, "<i2")
+
+
+class TurnDetectorChance:
+    """Silero speech probability per frame, fresh state for each recording."""
+
+    def __init__(self):
+        from turn_detector import SileroStream
+        self.stream = SileroStream()
+
+    def __call__(self, frame):
+        return self.stream(frame)
+
+
 def submit_or_refuse(context, kind, title, payload):
     if not API_KEY and kind != "audio_render":
         raise HTTPException(400, "请设置 DEEPSEEK_API_KEY 环境变量后重启后端")
@@ -785,6 +827,286 @@ async def delete_audio(request: Request, name: str):
     audio_path(context, name).unlink()
     context.action_log.record("delete_audio", {"name": name}, "page", "executed")
     return {"ok": True}
+
+
+@app.get("/api/practice")
+async def practice_overview(request: Request):
+    """Levels, the learner's last level, recent conversations, and how many items each book holds."""
+    context = require_user(request)
+    sessions = await asyncio.to_thread(context.english.sessions, 10)
+    return {"levels": [{"id": key, "title": title} for key, (title, _) in practice.LEVELS.items()],
+            "level": context.settings().get("english_level", "intermediate"),
+            "sessions": [{"id": item["id"], "level": practice.LEVELS[item["level"]][0], "topic": item["topic"],
+                          "started_at": item["started_at"], "turns": sum(turn["who"] == "learner" for turn in item["transcript"]),
+                          "notes": len(item["notes"]), "has_report": bool(item["report"]), "ended": bool(item["ended_at"])}
+                         for item in sessions],
+            "counts": await asyncio.to_thread(context.english.counts)}
+
+
+@app.get("/api/practice/sessions/{session_id}")
+async def practice_session_detail(request: Request, session_id: int):
+    """One conversation in full: every turn, its corrections, and the report once written."""
+    context = require_user(request)
+    session = await asyncio.to_thread(context.english.session, session_id)
+    if not session:
+        raise HTTPException(404, "没有这次对话")
+    return {**session, "level_title": practice.LEVELS[session["level"]][0]}
+
+
+@app.get("/api/practice/sessions/{session_id}/audio/{turn}")
+async def practice_turn_audio(request: Request, session_id: int, turn: int):
+    """One turn's recording: what the learner said, or what the partner said back."""
+    context = require_user(request)
+    session = await asyncio.to_thread(context.english.session, session_id)
+    if not session or not 0 <= turn < len(session["transcript"]) or not session["transcript"][turn].get("audio"):
+        raise HTTPException(404, "这一句没有录音")
+    path = context.root / "english_audio" / Path(session["transcript"][turn]["audio"]).name
+    if not path.is_file():
+        raise HTTPException(404, "这一句的录音已不在了")
+    return FileResponse(path, media_type="audio/ogg")
+
+
+class SayRequest(BaseModel):
+    text: str
+    voice: str = "standard"
+
+
+def own_clone(context):
+    """The learner's own cloned voice: the one in use if it is a clone, otherwise the first one uploaded."""
+    choice = current_voice()
+    if choice.provider == "cosyvoice" and choice.clone_id:
+        return choice.clone_id
+    profiles = context.voices.list()
+    return profiles[0]["id"] if profiles else None
+
+
+@app.post("/api/practice/say")
+async def practice_say(request: Request, body: SayRequest):
+    """An English sentence read aloud, to compare with how the learner said it: the standard English voice
+    (edge-tts, free, sends the text to Microsoft) or the learner's own cloned voice (CosyVoice on this machine).
+    The same sentence in the same voice is made once and kept, so replaying it costs nothing."""
+    context = require_user(request, write=True)
+    text = " ".join(body.text.split())
+    if not 1 <= len(text) <= practice.MAX_SAY_CHARS or not practice.words(text):
+        raise HTTPException(400, f"要读的句子需要是 1 到 {practice.MAX_SAY_CHARS} 字的英文")
+    if body.voice not in ("standard", "mine"):
+        raise HTTPException(400, "音色只能是标准读法或我的声音")
+    profile_id = own_clone(context) if body.voice == "mine" else None
+    if body.voice == "mine" and not profile_id:
+        raise HTTPException(400, "还没有自己的音色：先在“音色”页上传一段自己的录音")
+    folder = context.root / "english_audio" / "say"
+    path = folder / f"{body.voice}-{hashlib.sha1(((profile_id or '') + '|' + text).encode('utf-8')).hexdigest()}.ogg"
+    if not path.is_file():
+        try:
+            if body.voice == "standard":
+                audio = await synthesize(text, PRACTICE_VOICE)
+            else:
+                audio = await synthesize_clone_when_free(context.voices.get(profile_id), text)
+        except CloneBusy as error:
+            raise HTTPException(429, "克隆服务正在合成别的内容，请稍后再点") from error
+        except (httpx.HTTPError, OSError) as error:
+            raise HTTPException(503, "无法连接本机 CosyVoice 服务，请先运行 start_cosyvoice.ps1") from error
+        except (RuntimeError, ValueError) as error:
+            raise HTTPException(502, str(error)) from error
+        samples = await asyncio.to_thread(audio_content.to_samples, audio)
+        folder.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(path.write_bytes, await asyncio.to_thread(to_ogg_opus, audio_content.wav_bytes(samples)))
+    return FileResponse(path, media_type="audio/ogg")
+
+
+class TranslateRequest(BaseModel):
+    text: str
+
+
+class ExplainRequest(BaseModel):
+    text: str
+    context: str = ""
+
+
+def english_text(text, limit):
+    text = " ".join(text.split())
+    if not 1 <= len(text) <= limit or not practice.words(text):
+        raise HTTPException(400, f"需要是 1 到 {limit} 字的英文")
+    return text
+
+
+async def ask_agent(context, spec, material, task):
+    """One small agent call for the page; the daily spending cap applies like any background agent."""
+    if not API_KEY:
+        raise HTTPException(400, "请设置 DEEPSEEK_API_KEY 环境变量后重启后端")
+    try:
+        return await agents.run_agent(spec, material, agent_chat, context.user_id, LLM_MODEL, task=task)
+    except agents.AgentStopped as error:
+        raise HTTPException(429, str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(502, str(error)) from error
+
+
+@app.post("/api/english/translate")
+async def english_translate(request: Request, body: TranslateRequest):
+    """A Chinese translation of one sentence, made when first asked for and kept."""
+    context = require_user(request, write=True)
+    text = english_text(body.text, practice.MAX_SAY_CHARS)
+    cache, key = LookupCache(context.root / "agent.db"), "zh:" + hashlib.sha1(text.encode("utf-8")).hexdigest()
+    if (saved := await asyncio.to_thread(cache.get, key)) is not None:
+        return {"text": text, "zh": saved}
+    zh = (await ask_agent(context, practice.TRANSLATOR, text, "请翻译：")).strip()
+    if not zh:
+        raise HTTPException(502, "没有得到翻译，请再试一次")
+    await asyncio.to_thread(cache.set, key, zh)
+    return {"text": text, "zh": zh}
+
+
+@app.post("/api/english/explain")
+async def english_explain(request: Request, body: ExplainRequest):
+    """What a selected word, phrase or sentence means where it was used, how to say it, and an example.
+
+    Looking something up means it was not understood, so it goes into the vocabulary book (once; looking it
+    up again just counts it again)."""
+    context = require_user(request, write=True)
+    text = english_text(body.text, practice.MAX_LOOKUP_CHARS)
+    around = " ".join(body.context.split())[:500]
+    cache = LookupCache(context.root / "agent.db")
+    key = "explain:" + hashlib.sha1(f"{text.lower()}|{around.lower()}".encode("utf-8")).hexdigest()
+    result = await asyncio.to_thread(cache.get, key)
+    if result is None:
+        answer = await ask_agent(context, practice.EXPLAINER, f"选中的内容：{text}\n所在的句子：{around or text}", "请解释选中的内容。")
+        result = practice.parse_explanation(answer)
+        if not result:
+            raise HTTPException(502, "没有得到解释，请再试一次")
+        await asyncio.to_thread(cache.set, key, result)
+    kind = practice.lookup_kind(text)
+    item_id = await asyncio.to_thread(context.english.add_item, kind, text, result["meaning"], phonetic=result["phonetic"],
+                                      note=result["note"], context=around)
+    return {"text": text, "kind": kind, "item_id": item_id, **result}
+
+
+async def quiet_agent(context, spec, material, task):
+    """An agent call whose failure just means falling back (no key, over budget, network): returns "" then."""
+    if not API_KEY:
+        return ""
+    try:
+        return await agents.run_agent(spec, material, agent_chat, context.user_id, LLM_MODEL, task=task)
+    except Exception:
+        return ""
+
+
+@app.get("/api/english/review")
+async def english_review(request: Request):
+    """How many items are due now, when the next one is, and recent quiz scores."""
+    context = require_user(request)
+    due, upcoming = await asyncio.to_thread(context.english.due_count)
+    return {"due": due, "next_due_at": upcoming, "quizzes": await asyncio.to_thread(context.english.quizzes, 5)}
+
+
+@app.post("/api/english/quizzes")
+async def english_quiz_start(request: Request):
+    """A quiz from what is due: mistakes first, then whatever has waited longest, ten at most."""
+    context = require_user(request, write=True)
+    items = await asyncio.to_thread(context.english.due, quiz.MAX_QUESTIONS)
+    if not items:
+        due, upcoming = await asyncio.to_thread(context.english.due_count)
+        raise HTTPException(400, "现在没有要复习的内容" + (f"，下一个在 {upcoming[:16].replace('T', ' ')}" if upcoming else "：先在对话里积累错题和生词"))
+    wanted = [item for item in items if quiz.plan(item) == "choice"]
+    distractors = {}
+    if wanted:
+        distractors = quiz.parse_distractors(await quiet_agent(context, quiz.DISTRACTORS, quiz.distractor_material(wanted), "请出干扰项："))
+        # Without the model, wrong options can come from the learner's other items.
+        others = list({item["meaning"] for item in await asyncio.to_thread(context.english.items, None, True, 200) if item["meaning"] and item["kind"] != "mistake"})
+        for item in wanted:
+            if item["id"] not in distractors:
+                pool = [meaning for meaning in others if meaning != item["meaning"]]
+                if len(pool) >= 3:
+                    distractors[item["id"]] = random.sample(pool, 3)
+    questions = quiz.build(items, distractors)
+    quiz_id = await asyncio.to_thread(context.english.create_quiz, questions)
+    return {"id": quiz_id, "questions": quiz.for_page(questions)}
+
+
+class QuizAnswers(BaseModel):
+    answers: dict
+
+
+@app.post("/api/english/quizzes/{quiz_id}/submit")
+async def english_quiz_submit(request: Request, quiz_id: int, body: QuizAnswers):
+    """Grade a quiz once: rules where they decide, the grader agent for translations and corrections, then move
+    every item along its review schedule."""
+    context = require_user(request, write=True)
+    saved = await asyncio.to_thread(context.english.quiz, quiz_id)
+    if not saved:
+        raise HTTPException(404, "没有这次测验")
+    if saved["finished_at"]:
+        raise HTTPException(409, "这次测验已经交过了")
+    answers = {str(key): value for key, value in body.answers.items()}
+    questions = saved["questions"]
+    verdicts = {question["id"]: quiz.grade_locally(question, answers.get(str(question["id"]))) for question in questions}
+    open_questions = [question for question in questions if verdicts[question["id"]] is None]
+    grades = quiz.parse_grades(await quiet_agent(context, quiz.GRADER, quiz.grader_material(open_questions, answers), "请批改：")) if open_questions else {}
+    results = []
+    for question in questions:
+        answer = answers.get(str(question["id"]))
+        ok, comment = verdicts[question["id"]], ""
+        if ok is None:
+            grade = grades.get(question["id"])
+            ok, comment = (grade["ok"], grade["comment"]) if grade else (quiz.closeness(question["expected"], answer) >= quiz.OPEN_PASS, "")
+        review = await asyncio.to_thread(context.english.record_review, question["item_id"], ok)
+        expected = question["options"][question["expected"]] if question["type"] == "choice" else question["expected"]
+        results.append({"id": question["id"], "ok": ok, "expected": expected, "comment": comment, "review": review})
+    score = sum(result["ok"] for result in results)
+    if not await asyncio.to_thread(context.english.finish_quiz, quiz_id, answers, results, score):
+        raise HTTPException(409, "这次测验已经交过了")
+    return {"score": score, "total": len(results), "results": results}
+
+
+@app.get("/api/english/items")
+async def english_items(request: Request, kind: str = "", mastered: bool = False):
+    context = require_user(request)
+    if kind and kind not in ITEM_KINDS:
+        raise HTTPException(400, "没有这种条目")
+    return {"items": await asyncio.to_thread(context.english.items, kind or None, mastered)}
+
+
+@app.post("/api/english/items/{item_id}/mastered")
+async def english_item_mastered(request: Request, item_id: int, undo: bool = False):
+    context = require_user(request, write=True)
+    if not await asyncio.to_thread(context.english.set_mastered, item_id, not undo):
+        raise HTTPException(404, "没有这个条目")
+    return {"ok": True}
+
+
+@app.delete("/api/english/items/{item_id}")
+async def english_item_delete(request: Request, item_id: int):
+    context = require_user(request, write=True)
+    if not await asyncio.to_thread(context.english.delete_item, item_id):
+        raise HTTPException(404, "没有这个条目")
+    return {"ok": True}
+
+
+@app.post("/api/practice/read")
+async def practice_read(request: Request, audio: UploadFile = File(), target: str = Form()):
+    """Read-aloud check: what the recognizer heard, word by word against the sentence. Runs locally, costs nothing."""
+    require_user(request, write=True)
+    target = target.strip()
+    if not 1 <= len(target) <= 200 or not practice.words(target):
+        raise HTTPException(400, "跟读句子要是 1 到 200 字的英文")
+    pcm = await audio.read(MAX_BYTES + 1)
+    if len(pcm) % 2 or not 16000 * 2 * .3 <= len(pcm) <= 16000 * 2 * 15:
+        raise HTTPException(400, "录音应为 0.3～15 秒")
+    try:
+        heard = await asyncio.wait_for(asyncio.to_thread(transcribe, pcm, "en"), ASR_TIMEOUT_SECONDS)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    return practice.read_aloud(target, heard)
+
+
+@app.post("/api/practice/{session_id}/report")
+async def practice_report_again(request: Request, session_id: int):
+    """Ask again for a report, for a session whose report could not start when it ended."""
+    context = require_user(request, write=True)
+    session = await asyncio.to_thread(context.english.session, session_id)
+    if not session or not session["ended_at"] or not session["transcript"]:
+        raise HTTPException(404, "没有可总结的对话")
+    return submit_or_refuse(context, "practice_report", "英语对话总结", {"session_id": session_id})
 
 
 class TaskRequest(BaseModel):
@@ -1004,14 +1326,22 @@ async def websocket(ws: WebSocket):
     playing_text = recent_text = ""
     paused = interrupted = False
     request_id = 0
+    # Free English conversation, when on: level, topic, the partner's own short history, what was said, corrections.
+    practice_session = None
+    evaluations = set()
+    last_heard = None  # (text, pcm) of the last sentence heard while listening in English practice
     confirmation = None
     send_lock = asyncio.Lock()
+
+    spoken_audio = None  # (rid, [audio...]) of the English partner's reply being spoken
 
     async def send(kind, rid, **data):
         async with send_lock:
             await ws.send_json({"type": kind, "request_id": rid, **data})
 
     async def send_audio(rid, audio, text):
+        if spoken_audio is not None and rid == spoken_audio[0]:
+            spoken_audio[1].append(audio)  # kept so the partner's turn can be replayed later
         mime = "audio/wav" if audio.startswith(b"RIFF") else "audio/mpeg"
         # A cloned reply is WAV, about ten times the size of the same speech in Ogg/Opus.
         if mime == "audio/wav" and downlink_ogg:
@@ -1034,7 +1364,7 @@ async def websocket(ws: WebSocket):
 
     def can_interrupt_nobody():
         speaking = detector is not None and getattr(detector, "audio", None) is not None
-        return not (reply_active() or recording or speaking or claimed)
+        return not (reply_active() or recording or speaking or claimed or practice_session)
 
     async def reminder_watcher():
         # Only an open page can speak, so a reminder stays pending until one is connected and idle.
@@ -1098,7 +1428,8 @@ async def websocket(ws: WebSocket):
             if not partial and default_registry.get("demo_confirm"):
                 keep_demo_audio(audio)
             try:
-                heard = await asyncio.wait_for(asyncio.to_thread(transcribe, audio), ASR_TIMEOUT_SECONDS)
+                hearing = asyncio.to_thread(transcribe, audio, "en") if practice_session else asyncio.to_thread(transcribe, audio)
+                heard = await asyncio.wait_for(hearing, ASR_TIMEOUT_SECONDS)
             except ValueError:
                 heard = ""
             except Exception:
@@ -1130,12 +1461,121 @@ async def websocket(ws: WebSocket):
                     await voice("resume")
                 await voice("ignored", reason=reason)
             else:
+                if action == "question" and practice_session is not None:
+                    nonlocal_last_heard(heard, audio)
                 await voice(action, text=heard if action == "question" else "")
 
+    def nonlocal_last_heard(text, pcm):
+        nonlocal last_heard
+        last_heard = (text, pcm)
+
+    def take_heard(text):
+        """The recording of a listened sentence the page has just sent back as text, used once."""
+        nonlocal last_heard
+        heard, last_heard = last_heard, None
+        return heard[1] if heard and heard[0] == text else None
+
+    def save_turn_audio(session, turn, parts=None, pcm=None):
+        """Keep one turn's audio as Ogg/Opus for replay: the learner's 16 kHz recording, or the partner's spoken
+        reply (parts, as sent: MP3 or WAV per sentence). Returns the file name, or None; never fails a reply."""
+        try:
+            wav = practice.wav16k(pcm) if pcm is not None else audio_content.wav_bytes(numpy_concat([audio_content.to_samples(part) for part in parts]))
+            name = f"{session['id']}-{turn}.ogg"
+            folder = context.root / "english_audio"
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / name).write_bytes(to_ogg_opus(wav))
+            return name
+        except Exception:
+            latency_log.exception("could not save practice audio")
+            return None
+
+    def save_progress(session):
+        """Every turn is saved as it happens, so a conversation survives a closed page or a restart."""
+        with contextlib.suppress(Exception):
+            context.english.save_progress(session["id"], session["turns"], session["notes"])
+
+    async def evaluate(session, heard, before, rid, turn, pcm=None):
+        """Review one learner sentence beside the partner's reply; any part that fails is just left out.
+
+        The corrector judges language and content; a spoken sentence also gets a local fluency reference and,
+        when a provider is set up, a pronunciation score. Everything is kept on the turn, a correction also
+        goes into the mistake book, and the page gets each with the turn it belongs to.
+        """
+        async def judge():
+            try:
+                return await agents.run_agent(practice.CORRECTOR, f"陪练上一句：{before or '（开场）'}\n学生这一句：{heard}",
+                                              agent_chat, context.user_id, LLM_MODEL, task="请检查学生这一句。")
+            except Exception:
+                return ""
+
+        async def measure():
+            if pcm is None:
+                return None, None
+            fluency = await asyncio.to_thread(practice.speech_stats, pcm, heard, TurnDetectorChance())
+            scores = await asyncio.to_thread(pronunciation.assess, pcm, heard)
+            return fluency, scores
+
+        text, (fluency, scores) = await asyncio.gather(judge(), measure())
+        note = practice.parse_note(text, heard)
+        still_there = turn < len(session["turns"]) and session["turns"][turn].get("text") == heard and session["turns"][turn]["who"] == "learner"
+        if not still_there:
+            return
+        review = {"logic": practice.parse_logic(text), "fluency": fluency, "pron": scores}
+        if not note and session.get("review"):
+            credited = session.setdefault("credited", [])
+            fresh = [word for word in session["review"] if word["id"] not in credited]
+            used = practice.used_words(heard, [word["text"] for word in fresh])
+            for word in fresh:
+                if word["text"] in used:
+                    credited.append(word["id"])
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(context.english.record_review, word["id"], True)
+            if used:
+                review["used"] = used
+        if any(review.values()):
+            session["turns"][turn]["review"] = review
+            await asyncio.to_thread(save_progress, session)
+            with contextlib.suppress(Exception):
+                await send("practice_review", rid, turn=turn, **review)
+            for word in pronunciation.weak_words(scores):
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(context.english.add_item, "word", word["word"], note=f"发音需要练习（{word['score']} 分）",
+                                            context=heard, session_id=session["id"])
+        if note:
+            note["turn"] = turn
+            session["notes"].append(note)
+            await asyncio.to_thread(save_progress, session)
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(context.english.add_item, "mistake", heard, note["corrected"] or note["better"],
+                                        note=note["explain"], context=note["original"], session_id=session["id"])
+            with contextlib.suppress(Exception):
+                await send("practice_note", rid, **note)
+
+    async def finish_practice(session):
+        """Save the session once its last corrections are in, then hand it to the report agent."""
+        pending_notes = [item for item in evaluations if not item.done()]
+        if pending_notes:
+            await asyncio.wait(pending_notes, timeout=8)
+        context.english.finish(session["id"], session["turns"], session["notes"])
+        task_id, error = None, ""
+        if any(turn["who"] == "learner" for turn in session["turns"]):
+            try:
+                task_id = task_runner.submit(context, "practice_report", "英语对话总结", {"session_id": session["id"]})
+            except (agents.AgentStopped, ValueError) as refused:
+                error = str(refused)
+        else:
+            error = "这次没有对话，不生成总结"
+        with contextlib.suppress(Exception):
+            await send("practice_stopped", None, session_id=session["id"], task_id=task_id, error=error, notes=len(session["notes"]))
+
     async def reply(rid, text=None, audio=None, source="text"):
+        nonlocal spoken_audio
         worker = None
+        spoken_pcm = None
+        # Practice is decided once per reply, like the voice: stopping practice never changes a reply halfway.
+        session = practice_session
         # Read once per reply, so a voice change applies from the next reply, never halfway through one.
-        voice = current_voice()
+        voice = PRACTICE_VOICE if session else current_voice()
         tts_failed = False
         started = time.perf_counter()
         first_audio = True
@@ -1151,10 +1591,11 @@ async def websocket(ws: WebSocket):
         try:
             if audio is not None:
                 await send("status", rid, text="正在识别…")
-                text = await asyncio.to_thread(transcribe, audio)
+                text = await (asyncio.to_thread(transcribe, audio, "en") if session else asyncio.to_thread(transcribe, audio))
+                spoken_pcm = audio
                 mark("asr_done")
                 if not text:
-                    await send("error", rid, text="未识别到语音，请靠近麦克风重试")
+                    await send("error", rid, text=await asyncio.to_thread(no_speech_message, audio))
                     return
                 await send("transcript", rid, text=text)
             if not API_KEY:
@@ -1183,7 +1624,7 @@ async def websocket(ws: WebSocket):
                                      "balanced":"正在合成首段（最多20字）…" if first_audio else "正在合成下一小段（最多20字），文字可先阅读…"}[CLONE_PLAYBACK]
                         await send("status", rid, text=label)
                         mark("tts_start")
-                        async with contextlib.aclosing(synthesize_parts(sentence)) as parts:
+                        async with contextlib.aclosing(synthesize_parts(sentence, voice if session else None)) as parts:
                             async for audio in parts:
                                 if first_audio:
                                     mark("first_audio")
@@ -1233,7 +1674,7 @@ async def websocket(ws: WebSocket):
                             break
                         await queue.put(segment)
                 while not clone_full_reply:
-                    sentence, pending = split_sentence(pending)
+                    sentence, pending = (practice.split_english if session else split_sentence)(pending)
                     if sentence is None:
                         break
                     await queue.put(sentence)
@@ -1274,19 +1715,60 @@ async def websocket(ws: WebSocket):
                                    on_usage=lambda used: usage.LEDGER.record_chat(context.user_id, LLM_MODEL, used))
 
             user_message = {"role": "user", "content": text}
-            system_message = {"role": "system", "content": build_system_prompt(
-                SYSTEM, current_city(), context.memories.recent(), finished_actions, context.reminders.pending())}
-            demo = default_registry.get("demo_confirm") and re.sub(r"[\W_]+", "", text) == DEMO_PHRASE
-            added = await run_turn([system_message, *history.messages(), user_message], default_registry,
-                                   demo_chat if demo else chat, on_llm_event, confirm, audit)
+            if session:
+                # The partner: its own prompt and history, no tools, billed as "tutor". The corrector starts now,
+                # beside it, so a correction costs the learner no waiting.
+                if text != practice.OPENING:
+                    before = next((turn["text"] for turn in reversed(session["turns"]) if turn["who"] == "tutor"), "")
+                    session["turns"].append({"who": "learner", "text": text})
+                    turn = len(session["turns"]) - 1
+                    pcm = spoken_pcm if spoken_pcm is not None else (take_heard(text) if source == "listen" else None)
+                    if pcm is not None:
+                        recording_name = await asyncio.to_thread(save_turn_audio, session, turn, pcm=pcm)
+                        if recording_name:
+                            session["turns"][turn].update(audio=recording_name, seconds=round(len(pcm) / 32000, 1))
+                    await send("practice_turn", rid, turn=turn, who="learner", audio=bool(session["turns"][turn].get("audio")))
+                    await asyncio.to_thread(save_progress, session)
+                    evaluation = asyncio.create_task(evaluate(session, text, before, rid, turn, pcm))
+                    evaluations.add(evaluation)
+                    evaluation.add_done_callback(evaluations.discard)
+                system_message = {"role": "system", "content": practice.partner_prompt(
+                    session["level"], session["topic"], [word["text"] for word in session.get("review", [])])}
+                spoken_audio = (rid, [])
+                # Everything before this sentence; the opening has nothing before it.
+                earlier = [] if text == practice.OPENING else practice.history_for(session["turns"][:-1])[-practice.HISTORY_MESSAGES:]
+                agent_token = usage.CURRENT_AGENT.set("tutor")
+                try:
+                    added = await run_turn([system_message, *earlier, user_message], NO_TOOLS, chat, on_llm_event)
+                finally:
+                    usage.CURRENT_AGENT.reset(agent_token)
+            else:
+                system_message = {"role": "system", "content": build_system_prompt(
+                    SYSTEM, current_city(), context.memories.recent(), finished_actions, context.reminders.pending())}
+                demo = default_registry.get("demo_confirm") and re.sub(r"[\W_]+", "", text) == DEMO_PHRASE
+                added = await run_turn([system_message, *history.messages(), user_message], default_registry,
+                                       demo_chat if demo else chat, on_llm_event, confirm, audit)
             mark("llm_done")
             if pending.strip():
                 await queue.put(pending)
             await queue.put(None)
             await worker
             mark("all_audio_sent")
-            history.add_turn([user_message, *without_outside_results(added, default_registry)])
-            finished_actions.clear()
+            if session:
+                answer = added[-1].get("content") or ""
+                session["turns"].append({"who": "tutor", "text": answer})
+                turn = len(session["turns"]) - 1
+                parts = spoken_audio[1] if spoken_audio and spoken_audio[0] == rid else []
+                spoken_audio = None
+                if parts:
+                    name = await asyncio.to_thread(save_turn_audio, session, turn, parts)
+                    if name:
+                        session["turns"][turn]["audio"] = name
+                await send("practice_turn", rid, turn=turn, who="tutor", audio=bool(session["turns"][turn].get("audio")))
+                await asyncio.to_thread(save_progress, session)
+            else:
+                history.add_turn([user_message, *without_outside_results(added, default_registry)])
+                finished_actions.clear()
             await send("done", rid, tts_failed=tts_failed)
             record_latency(timings, len(added[-1].get("content") or ""), voice.provider)
         except asyncio.CancelledError:
@@ -1340,6 +1822,12 @@ async def websocket(ws: WebSocket):
                 decoder = None
                 paused = interrupted = False
                 continue
+            if kind == "practice_stop":
+                if practice_session is not None:
+                    await stop()
+                    ended, practice_session = practice_session, None
+                    asyncio.create_task(finish_practice(ended))
+                continue
             if kind == "playing":
                 playing_text, recent_text = str(data.get("text", ""))[:500], str(data.get("recent", ""))[:1000]
                 continue
@@ -1353,6 +1841,59 @@ async def websocket(ws: WebSocket):
             elif kind == "announce" and rid == request_id and data.get("reminder_id") in claimed:
                 await stop()
                 task = asyncio.create_task(announce(rid, claimed.pop(data["reminder_id"])))
+            elif kind == "practice_start":
+                level, topic = data.get("level"), " ".join(str(data.get("topic") or "").split())
+                if level not in practice.LEVELS:
+                    await send("error", rid, text="请选择英语水平")
+                    continue
+                if len(topic) > practice.MAX_TOPIC_CHARS:
+                    await send("error", rid, text=f"话题最多 {practice.MAX_TOPIC_CHARS} 字")
+                    continue
+                await stop()
+                request_id, recording = rid, False
+                pcm.clear()
+                if practice_session is not None:
+                    asyncio.create_task(finish_practice(practice_session))
+                context.save_settings({"english_level": level})
+                review = [{"id": item["id"], "text": item["text"]} for item in context.english.due(3, kinds=("word", "phrase"))]
+                practice_session = {"id": context.english.start(level, topic), "level": level, "topic": topic, "turns": [], "notes": [],
+                                    "review": review}
+                await send("practice_started", rid, level=practice.LEVELS[level][0], topic=topic, session_id=practice_session["id"],
+                           review_words=[word["text"] for word in review])
+                task = asyncio.create_task(reply(rid, text=practice.OPENING, source="practice"))
+            elif kind == "practice_resume":
+                # Start a new conversation from just before one sentence of an earlier one, to say it again.
+                earlier = context.english.session(data.get("session_id")) if isinstance(data.get("session_id"), int) else None
+                turn = data.get("turn")
+                if not earlier or not practice.is_learner_turn(earlier["transcript"], turn):
+                    await send("error", rid, text="找不到要重说的那一句")
+                    continue
+                await stop()
+                request_id, recording = rid, False
+                pcm.clear()
+                if practice_session is not None:
+                    asyncio.create_task(finish_practice(practice_session))
+                kept = earlier["transcript"][:turn]
+                notes = [note for note in earlier["notes"] if note.get("turn", turn) < turn]
+                practice_session = {"id": context.english.start(earlier["level"], earlier["topic"]), "level": earlier["level"],
+                                    "topic": earlier["topic"], "turns": kept, "notes": notes}
+                await asyncio.to_thread(save_progress, practice_session)
+                await send("practice_started", rid, level=practice.LEVELS[earlier["level"]][0], topic=earlier["topic"],
+                           session_id=practice_session["id"], turns=kept, notes=notes, redo=earlier["transcript"][turn]["text"])
+            elif kind == "practice_rewind":
+                # Take back one of your sentences and everything after it, then say it again.
+                turn = data.get("turn")
+                if practice_session is None or not practice.is_learner_turn(practice_session["turns"], turn):
+                    await send("error", rid, text="找不到要重说的那一句")
+                    continue
+                await stop()
+                request_id, recording = rid, False
+                pcm.clear()
+                redo = practice_session["turns"][turn]["text"]
+                practice_session["turns"] = practice_session["turns"][:turn]
+                practice_session["notes"] = [note for note in practice_session["notes"] if note.get("turn", turn) < turn]
+                await asyncio.to_thread(save_progress, practice_session)
+                await send("practice_rewound", rid, turn=turn, text=redo)
             elif kind in {"interrupt", "text", "audio_start"}:
                 await stop()
                 request_id = rid
@@ -1379,3 +1920,5 @@ async def websocket(ws: WebSocket):
         if hear_task:
             hear_task.cancel()
         await stop()
+        if practice_session is not None:
+            asyncio.create_task(finish_practice(practice_session))

@@ -8,13 +8,20 @@ const CONFIRM_HINT = '请说“确定执行”或“取消”，也可以点按�
 let confirming = null;
 const playing = new Set();
 function status(text) { $('status').textContent = text; }
+// Your bubble for each turn, so something that arrives later (an English correction) can be shown under it.
+const userBubbles = new Map();
+function userBubbleFor(rid) { return userBubbles.get(rid); }
 function bubble(role, text = '') {
   $('empty')?.remove();
   const box = document.createElement('div'); box.className = 'bubble ' + role;
   const label = document.createElement('div'); label.className = 'label';
-  label.textContent = role === 'user' ? '你' : 'DeepSeek 助手';
+  label.textContent = role === 'user' ? '你' : '助手';
   const content = document.createElement('div'); content.textContent = text;
   box.append(label, content); $('history').append(box);
+  if (role === 'user') {
+    userBubbles.set(requestId, box);
+    for (const old of userBubbles.keys()) { if (userBubbles.size <= 50) break; userBubbles.delete(old); }
+  }
   $('history').scrollTop = $('history').scrollHeight; return content;
 }
 async function unlockAudio() {
@@ -360,6 +367,8 @@ function connect() {
     if (message.type === 'voice') { handleVoice(message); return; }
     // Not tied to the current turn: a write that finished stays undoable after an interruption.
     if (message.type === 'memory_changed') { window.memoryChanged?.(message); return; }
+    // Speaking practice: started, a correction for a sentence, ended. The tutor's replies use the usual path.
+    if (message.type?.startsWith('practice_')) { window.practiceMessage?.(message); return; }
     // The server only sends this when idle. A new turn lets the usual reply path show and speak it.
     if (message.type === 'reminder_due') {
       const turn = nextTurn(); unlockAudio().catch(() => {}); replyActive = true;
@@ -395,17 +404,7 @@ function connect() {
     }
   };
 }
-function refreshHealth() { return fetch('/api/status').then(r=>{ if (r.status === 401) location.replace('/'); return r.json(); }).then(data=>{
-  $('account').textContent = data.email || ''; if (document.activeElement !== $('city')) $('city').value = data.default_city ?? '';
-  $('health').textContent = `识别模型：${data.asr_provider || 'whisper'} · ${data.asr_ready?'已准备':'尚未下载，请运行 prepare_asr.py'}\nDeepSeek：${data.llm_model} · ${data.api_key_configured?'Key 已载入（不代表聊天调用成功）':'请设置 DEEPSEEK_API_KEY 后重启'}${data.api_host ? `\n接口：${data.api_host} · Key 指纹：${data.key_fingerprint}` : ''}\n语音播报：${data.tts_provider || 'windows'} · ${data.tts_voice}${data.tts_provider==='edge'?' · 语速 '+data.tts_rate:''}${data.tts_provider==='cosyvoice'?' · '+({balanced:'短首句优先',stream:'流式播放',smooth:'完整回复连续播放'}[data.clone_playback] || '请重启聊天服务'):''}
-可用工具：${(data.tools || []).join('、') || '无'}`;
-}).catch(()=> $('health').textContent='状态检查失败'); }
-refreshHealth();
-$('logout').onclick = async () => { await fetch('/api/logout', {method:'POST'}).catch(()=>{}); location.replace('/'); };
-$('saveCity').onclick = async () => {
-  const response = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({default_city:$('city').value})});
-  status(response.ok ? '默认城市已保存' : '保存失败');
-};
+// Account, default city and service status live on the React settings page (static/ui/pages.js).
 refreshMics().catch(()=>{});
 navigator.mediaDevices?.addEventListener('devicechange', () => refreshMics().catch(()=>{}));
 connect();
