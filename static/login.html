@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录 · 语音助手</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f3f6fa;color:#213047;font:16px/1.65 system-ui,"Microsoft YaHei",sans-serif}main{max-width:420px;margin:72px auto;padding:24px}h1{font-size:28px;margin:0 0 8px}p{color:#607088}.card{background:white;border:1px solid #dde5ef;border-radius:16px;padding:24px}label{display:block;font-size:14px;color:#516178;margin-top:14px}input{width:100%;border:1px solid #cad5e2;border-radius:9px;padding:12px;font:inherit;margin-top:6px}button{border:0;border-radius:9px;padding:12px 18px;background:#176858;color:white;cursor:pointer;font-size:15px;width:100%;margin-top:20px}button:disabled{opacity:.5}.switch{background:none;color:#176858;width:auto;padding:0;margin-top:16px;font-size:14px}#message{min-height:24px;margin-top:12px;color:#b3261e;font-size:14px}.hint{font-size:13px;color:#77859a}
+</style>
+<main><h1>语音助手</h1><p id="subtitle">登录后使用你自己的记忆、提醒、知识库和音色。</p>
+<form class="card" id="form">
+<label>邮箱<input id="email" type="email" autocomplete="username" required maxlength="254"></label>
+<label>密码<input id="password" type="password" autocomplete="current-password" required minlength="8" maxlength="128"></label>
+<button id="submit" type="submit">登录</button>
+<div id="message" role="alert"></div>
+<button class="switch" id="switch" type="button">还没有账号？注册</button>
+<p class="hint">密码至少 8 位。每个账号的数据彼此隔离，只有你自己能看到。</p>
+</form></main>
+<script>
+const $ = id => document.getElementById(id);
+let registering = false;
+$('switch').onclick = () => {
+  registering = !registering;
+  $('submit').textContent = registering ? '注册并登录' : '登录';
+  $('switch').textContent = registering ? '已有账号？登录' : '还没有账号？注册';
+  $('password').autocomplete = registering ? 'new-password' : 'current-password';
+  $('message').textContent = '';
+};
+$('form').onsubmit = async event => {
+  event.preventDefault();
+  $('submit').disabled = true; $('message').textContent = '';
+  try {
+    const response = await fetch(registering ? '/api/register' : '/api/login', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:$('email').value, password:$('password').value})});
+    if (response.ok) { location.replace('/'); return; }
+    const result = await response.json().catch(() => ({}));
+    $('message').textContent = typeof result.detail === 'string' ? result.detail : '请检查邮箱和密码';
+  } catch { $('message').textContent = '网络错误，请重试'; }
+  $('submit').disabled = false;
+};
+</script></html>

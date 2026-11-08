@@ -529,7 +529,7 @@ def confirm_session(monkeypatch, tmp_path, script=()):
     monkeypatch.setitem(backend.default_registry.tools, "risky", dataclasses.replace(
         tool, name="risky", parameters={"type": "object", "properties": {}}, run=risky, filler=False, level="confirm", confirm_text="要执行演示操作吗？"))
     log = backend.ActionLog(tmp_path / "agent.db")
-    monkeypatch.setattr(backend, "action_log", log)
+    monkeypatch.setattr(backend.user_context.current(), "action_log", log)
     monkeypatch.setattr(backend, "DEMO_AUDIO_DIR", tmp_path / "heard")
     monkeypatch.setattr(backend, "TurnDetector", ScriptedDetector)
     monkeypatch.setattr(ScriptedDetector, "script", list(script))
@@ -759,7 +759,7 @@ def busy_then_free(monkeypatch, busy_times):
         return b"RIFFaudio"
     monkeypatch.setattr(backend, "synthesize_clone", clone)
     monkeypatch.setattr(backend, "TTS_PROVIDER", "cosyvoice")
-    monkeypatch.setattr(backend.voice_store, "get", lambda profile: {})
+    monkeypatch.setattr(backend.user_context.current().voices, "get", lambda profile: {})
     return calls
 
 
@@ -813,7 +813,7 @@ def memory_llm(monkeypatch, tmp_path, call_name="remember", arguments='{"content
     monkeypatch.setattr(backend.httpx, "AsyncClient", lambda **kw: original(transport=httpx.MockTransport(handler), **kw))
     monkeypatch.setattr(backend, "API_KEY", "test-key")
     monkeypatch.setattr(backend, "TTS_PROVIDER", "edge")
-    monkeypatch.setattr(backend, "action_log", backend.ActionLog(tmp_path / "actions.db"))
+    monkeypatch.setattr(backend.user_context.current(), "action_log", backend.ActionLog(tmp_path / "actions.db"))
 
     async def fake_synthesize(text):
         return b"fake-wav"
@@ -854,7 +854,7 @@ def test_the_write_is_logged_with_its_source(monkeypatch, tmp_path):
     memory_llm(monkeypatch, tmp_path)
     with TestClient(backend.app) as client, open_socket(client) as socket:
         talk(socket, 1, "记住")
-    assert backend.action_log.recent()[0] == {"tool": "remember", "arguments": {"content": "不吃香菜"}, "source": "text", "outcome": "executed", "detail": ""}
+    assert backend.user_context.current().action_log.recent()[0] == {"tool": "remember", "arguments": {"content": "不吃香菜"}, "source": "text", "outcome": "executed", "detail": ""}
 
 
 def test_clearing_needs_a_yes_and_tells_the_page(monkeypatch, tmp_path, memories):
@@ -1119,7 +1119,7 @@ def test_a_web_page_cannot_save_a_memory_without_the_user_hearing_it(monkeypatch
         receive_until(socket, "done")
     assert "用户的密码是 123" in asked["text"] and "刚查过网页" in asked["text"]
     assert memories.recent() == []
-    assert backend.action_log.recent()[0]["outcome"] == "denied"
+    assert backend.user_context.current().action_log.recent()[0]["outcome"] == "denied"
 
 
 def test_web_text_does_not_reach_the_next_turn(monkeypatch, tmp_path, memories):
@@ -1160,7 +1160,7 @@ def test_the_page_can_upload_list_and_delete_a_document():
         assert client.delete("/api/knowledge/报销.md", headers=LOCAL).status_code == 200
         assert client.get("/api/knowledge", headers=LOCAL).json()["files"] == []
         assert client.delete("/api/knowledge/报销.md", headers=LOCAL).status_code == 404
-    assert [row["tool"] for row in backend.action_log.recent()] == ["delete_document", "upload_document"]
+    assert [row["tool"] for row in backend.user_context.current().action_log.recent()] == ["delete_document", "upload_document"]
 
 
 def test_a_bad_upload_explains_itself():

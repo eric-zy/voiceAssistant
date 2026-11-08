@@ -45,7 +45,9 @@ def test_upload_select_preview_without_deepseek(tmp_path, monkeypatch):
         result = client.post("/api/voice/select", headers=ORIGIN,
                              json={"provider":"cosyvoice", "profile_id":profile["id"]})
         assert result.status_code == 200
-        assert store.settings()["profile_id"] == profile["id"]
+        # The choice is the signed-in user's own setting, not a server-wide one.
+        assert app.user_context.current().settings()["profile_id"] == profile["id"]
+        assert store.settings() == {}
         assert client.get("/api/status").json()["tts_voice"] == "我的声音"
         result = client.post("/api/voice/preview", headers=ORIGIN)
         assert result.status_code == 200 and result.headers["content-type"] == "audio/wav"
@@ -138,7 +140,8 @@ def test_preview_disconnect_cancels_upstream(monkeypatch):
                 state['closed'] = True
         monkeypatch.setattr(app,'synthesize',fake_synthesize)
         class Request:
-            headers = ORIGIN
+            headers = {**ORIGIN, "host": "127.0.0.1:8765"}
+            cookies = {}
             async def is_disconnected(self):
                 await entered.wait()
                 return True
@@ -168,3 +171,29 @@ def test_clone_stream_yields_before_upstream_finishes(tmp_path):
         await chunks.aclose()
         assert state['closed']
     asyncio.run(run())
+
+
+def upload(client, prompt_text):
+    return client.post("/api/voices", headers=ORIGIN, data={"name": "我的声音", "prompt_text": prompt_text},
+                       files={"audio": ("test.wav", make_wav(), "audio/wav")})
+
+
+def test_a_transcript_that_does_not_match_the_recording_is_refused(monkeypatch):
+    monkeypatch.setattr(app, "transcribe", lambda pcm: "今天天气很好，我们一起去公园散步吧")
+    with TestClient(app.app) as client:
+        response = upload(client, "测试一下")
+        assert response.status_code == 400 and "对不上" in response.json()["detail"] and "公园散步" in response.json()["detail"]
+        assert client.get("/api/voices").json()["profiles"] == []
+
+
+def test_a_matching_transcript_is_kept(monkeypatch):
+    monkeypatch.setattr(app, "transcribe", lambda pcm: "今天天气很好，我们一起去公园散步吧。")
+    with TestClient(app.app) as client:
+        assert upload(client, "今天天气很好我们一起去公园散步吧").status_code == 200
+        assert len(client.get("/api/voices").json()["profiles"]) == 1
+
+
+def test_a_recording_that_cannot_be_checked_is_not_blocked(monkeypatch):
+    monkeypatch.setattr(app, "transcribe", lambda pcm: "")
+    with TestClient(app.app) as client:
+        assert upload(client, "任何文字").status_code == 200

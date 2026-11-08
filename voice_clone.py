@@ -79,6 +79,11 @@ class VoiceStore:
         (folder / "profile.json").write_text(json.dumps(profile, ensure_ascii=False), encoding="utf-8")
         return {k: profile[k] for k in ("id", "name", "duration")}
 
+    def remove(self, profile_id):
+        import shutil
+        self.get(profile_id)
+        shutil.rmtree(self.root / profile_id)
+
     def settings(self):
         try:
             return json.loads((self.root / "settings.json").read_text(encoding="utf-8"))
