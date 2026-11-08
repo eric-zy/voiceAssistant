@@ -13,6 +13,7 @@ import tempfile
 import time
 import wave
 
+import av
 import httpx
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request, HTTPException
@@ -34,6 +35,7 @@ from memory_store import ActionLog  # noqa: F401  (tests build per-user logs thr
 import tools as agent_tools
 from tools import default_registry
 import agents
+import meeting
 import usage
 import user_context
 from urllib.parse import urlsplit
@@ -242,6 +244,9 @@ def transcribe(pcm: bytes) -> str:
         text = transcribe_sensevoice(pcm, samples) if ASR_PROVIDER == "sensevoice" else transcribe_whisper(samples)
     # Traditional output would never match the simplified reply when filtering out the speakers.
     return to_chinese_variant(text, "zh-cn")
+
+
+meeting.TRANSCRIBE = lambda pcm: transcribe(pcm)  # looked up per call, so tests can swap it
 
 
 def transcribe_sensevoice(pcm, samples):
@@ -590,6 +595,122 @@ async def delete_document(request: Request, name: str):
         raise HTTPException(404, "没有这个文件")
     context.action_log.record("delete_document", {"name": name}, "page", "executed")
     return {"ok": True}
+
+
+MEETING_FILE = re.compile(r"^[0-9a-f]{32}\.[a-z0-9]+$")
+
+
+def probe_audio(path):
+    """Quick check that an upload is audio of an allowed length, without decoding all of it."""
+    try:
+        with av.open(str(path)) as container:
+            if not container.streams.audio:
+                raise ValueError("文件里没有音频")
+            if container.duration and container.duration / 1e6 > meeting.MAX_SECONDS:
+                raise ValueError("录音超过 3 小时，请分段上传")
+    except av.error.FFmpegError as error:
+        raise ValueError("无法读取这个文件，请上传常见的音频格式") from error
+
+
+@app.post("/api/meetings")
+async def upload_meeting(request: Request, file: UploadFile = File(), date: str = Form("")):
+    """Save a recording under the user's own folder and start the notes task for it."""
+    context = require_user(request, write=True)
+    if not API_KEY:
+        raise HTTPException(400, "请设置 DEEPSEEK_API_KEY 环境变量后重启后端")
+    original = Path(file.filename or "录音").name
+    suffix = Path(original).suffix.lower()
+    if suffix not in meeting.EXTENSIONS:
+        raise HTTPException(400, "支持 " + "、".join(sorted(ext[1:] for ext in meeting.EXTENSIONS)))
+    if date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        raise HTTPException(400, "会议日期格式应为 YYYY-MM-DD")
+    folder = context.root / "meetings"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / (os.urandom(16).hex() + suffix)
+    size = 0
+    try:
+        with target.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > meeting.MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, "文件超过 200 MB")
+                output.write(chunk)
+        await asyncio.to_thread(probe_audio, target)
+        task_id = task_runner.submit(context, "meeting_notes", Path(original).stem, {"file": target.name, "name": original, "date": date})
+    except ValueError as error:
+        target.unlink(missing_ok=True)
+        raise HTTPException(400, str(error)) from error
+    except agents.AgentStopped as error:
+        target.unlink(missing_ok=True)
+        raise HTTPException(429, str(error)) from error
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+    context.action_log.record("upload_meeting", {"name": original}, "page", "executed")
+    return {"id": task_id}
+
+
+@app.delete("/api/meetings/{name}")
+async def delete_meeting_audio(request: Request, name: str):
+    context = require_user(request, write=True)
+    path = context.root / "meetings" / name
+    if not MEETING_FILE.match(name) or not path.is_file():
+        raise HTTPException(404, "没有这个录音")
+    path.unlink()
+    context.action_log.record("delete_meeting_audio", {"name": name}, "page", "executed")
+    return {"ok": True}
+
+
+class MeetingTodo(BaseModel):
+    task: str
+    due_at: str
+
+
+class MeetingTodos(BaseModel):
+    items: list[MeetingTodo]
+
+
+@app.post("/api/meetings/reminders")
+async def meeting_reminders(request: Request, body: MeetingTodos):
+    """Create the reminders the user ticked. Each one is checked like the voice tool checks its own."""
+    context = require_user(request, write=True)
+    created, problems = [], []
+    for item in body.items[:50]:
+        try:
+            result = await agent_tools.set_reminder(item.task, item.due_at)
+        except agent_tools.ToolError as error:
+            problems.append(f"{item.task[:20]}：{error}")
+            continue
+        context.action_log.record("set_reminder", {"content": item.task, "due_at": item.due_at}, "meeting", "executed")
+        created.append(result["undo"]["id"])
+    return {"created": created, "problems": problems}
+
+
+class MeetingArchive(BaseModel):
+    task_id: int
+
+
+@app.post("/api/meetings/archive")
+async def archive_meeting(request: Request, body: MeetingArchive):
+    """Save finished notes, to-dos and transcript as a Markdown file in the user's knowledge base."""
+    context = require_user(request, write=True)
+    task = await asyncio.to_thread(context.tasks.get, body.task_id)
+    if not task or task["kind"] != "meeting_notes" or task["status"] != "done":
+        raise HTTPException(404, "没有可存档的会议纪要")
+    result = task["result"]
+    todos = "\n".join(f"- {item['task']}" + (f"（{item['owner']}）" if item["owner"] else "") +
+                      (f" 截止：{item['due_text'] or item['due_at']}" if item["due_text"] or item["due_at"] else "")
+                      for item in result["proposals"]) or "无"
+    day = (await asyncio.to_thread(context.tasks.payload, body.task_id) or {}).get("date") or task["created_at"][:10]
+    text = (f"# 会议纪要：{task['title']}\n\n日期：{day}\n\n{result['text']}\n\n## 待办\n\n{todos}\n\n"
+            f"## 逐字稿\n\n{meeting.transcript_text(result['transcript'])}\n")
+    name = re.sub(r'[\\/:*?"<>|]', "_", f"会议纪要-{task['title']}-{day}.md")
+    try:
+        saved = await asyncio.to_thread(context.knowledge.save, name, text.encode("utf-8"))
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    context.action_log.record("upload_document", {"name": saved["name"]}, "meeting", "executed")
+    return saved
 
 
 class TaskRequest(BaseModel):

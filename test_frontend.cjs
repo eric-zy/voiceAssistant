@@ -625,3 +625,74 @@ test('a task that finished is announced once and marked seen, and polling stops'
   assert.equal(failed.get('status').textContent,'');
   assert.equal(failed.get('taskList').children[0].children[1].textContent,'今天的花费已到上限');
 });
+
+function meetingPage(tasks, replies={}) {
+  const elements = new Map(), calls = [];
+  const node = (tag) => ({tag,style:{},textContent:'',children:[],files:[],value:'',checked:false,disabled:false,open:false,hidden:false,
+    append(...items){this.children.push(...items);},replaceChildren(...items){this.children=items;}});
+  const get = id => { if (!elements.has(id)) elements.set(id,node('div')); return elements.get(id); };
+  const context = {$:get,document:{createElement:node},console,status(text){get('status').textContent=text;},
+    setTimeout:()=>0,clearTimeout(){},confirm:()=>true,FormData:class{constructor(){this.parts=[];}append(k,v){this.parts.push([k,v]);}},
+    refreshPanels(){calls.push(['refreshPanels']);},
+    fetch:async(url,options={})=>{calls.push([options.method||'GET',url,options.body]);
+      const body = url==='/api/tasks' && !options.method ? {tasks} : (replies[url] || {});
+      return {ok:!body.detail,json:async()=>body};}};
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/tasks.js','utf8'),context);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/meetings.js','utf8'),context);
+  return {get,context,calls};
+}
+const MEETING = {id:7,kind:'meeting_notes',title:'周会',status:'done',progress:'',error:'',seen:true,result:{
+  text:'结论：周五发布', file:'ab.wav', transcript:[{start:65,end:70,text:'<b>周五</b>发布'}],
+  proposals:[{task:'写发布说明',owner:'小王',due_text:'周四之前',due_at:'2099-01-01T18:00:00'},{task:'想想',owner:'',due_text:'',due_at:''}]}};
+function walk(node, out=[]) { out.push(node); for (const child of node.children||[]) walk(child, out); return out; }
+
+test('a finished meeting shows notes, ticked to-dos with editable times, and the transcript as text',async()=>{
+  const page=meetingPage([MEETING]);
+  await tick();
+  const all=walk(page.get('taskList'));
+  assert.ok(all.some(n=>n.textContent==='结论：周五发布'));
+  assert.ok(all.some(n=>n.textContent==='[01:05] <b>周五</b>发布'));
+  const boxes=all.filter(n=>n.type==='checkbox'), times=all.filter(n=>n.type==='datetime-local');
+  assert.deepEqual(boxes.map(b=>b.checked),[true,false]);
+  assert.equal(times[0].value,'2099-01-01T18:00');
+});
+
+test('only ticked to-dos are sent, with the time as edited, and the panels refresh',async()=>{
+  const page=meetingPage([MEETING],{'/api/meetings/reminders':{created:[3],problems:[]}});
+  await tick();
+  const all=walk(page.get('taskList'));
+  all.filter(n=>n.type==='datetime-local')[0].value='2099-02-02T09:30';
+  await all.find(n=>n.textContent==='把勾选的建为提醒').onclick();
+  const sent=page.calls.find(call=>call[1]==='/api/meetings/reminders');
+  assert.deepEqual(JSON.parse(sent[2]),{items:[{task:'写发布说明',due_at:'2099-02-02T09:30:00'}]});
+  assert.ok(all.some(n=>n.textContent==='已建 1 条提醒'));
+  assert.ok(page.calls.some(call=>call[0]==='refreshPanels'));
+});
+
+test('deleting the recording asks first and archiving reports the file name',async()=>{
+  const page=meetingPage([MEETING],{'/api/meetings/archive':{name:'会议纪要-周会.md'}});
+  await tick();
+  const all=walk(page.get('taskList'));
+  page.context.confirm=()=>false;
+  await all.find(n=>n.textContent==='删除录音').onclick();
+  assert.equal(page.calls.some(call=>call[0]==='DELETE'),false);
+  page.context.confirm=()=>true;
+  await all.find(n=>n.textContent==='删除录音').onclick();
+  assert.deepEqual(page.calls.find(call=>call[0]==='DELETE').slice(0,2),['DELETE','/api/meetings/ab.wav']);
+  await all.find(n=>n.textContent==='存进知识库').onclick();
+  await tick();
+  assert.ok(all.some(n=>n.textContent==='已存进知识库：会议纪要-周会.md'));
+});
+
+test('uploading needs a file, sends it with the date, and opens the tasks panel',async()=>{
+  const page=meetingPage([],{'/api/meetings':{id:1}});
+  await page.get('meetingUpload').onclick();
+  assert.equal(page.get('meetingStatus').textContent,'请先选择录音文件');
+  page.get('meetingFile').files=[{name:'周会.m4a'}]; page.get('meetingDate').value='2026-11-09';
+  await page.get('meetingUpload').onclick();
+  const sent=page.calls.find(call=>call[1]==='/api/meetings');
+  assert.deepEqual(sent[2].parts,[['file',{name:'周会.m4a'}],['date','2026-11-09']]);
+  assert.equal(page.get('taskPanel').open,true);
+  assert.match(page.get('meetingStatus').textContent,/已开始处理/);
+});

@@ -2,6 +2,8 @@
 const TASK_STATUS = {queued:'排队中', running:'进行中', done:'已完成', failed:'失败', cancelled:'已取消'};
 const TASK_POLL_MS = 3000;
 let taskTimer = null;
+// Features add a renderer for their finished results here, keyed by task kind.
+const taskDetails = {};
 function taskPreview(task) {
   if (task.status === 'failed') return task.error;
   if (task.status === 'running' || task.status === 'queued') return task.progress;
@@ -22,7 +24,8 @@ function taskRow(task) {
     head.append(cancel);
   }
   body.className = 'hint'; body.style.whiteSpace = 'pre-wrap'; body.textContent = taskPreview(task) || '';
-  row.append(head, body);
+  const detail = task.status === 'done' && task.result && taskDetails[task.kind];
+  row.append(head, detail ? detail(task) : body);
   return row;
 }
 async function refreshTasks() {
