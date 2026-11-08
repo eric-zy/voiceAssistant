@@ -61,12 +61,12 @@ def without_outside_results(messages, registry):
     return [{**message, "content": OMITTED_RESULT} if message.get("tool_call_id") in external else message for message in messages]
 
 
-async def run_turn(messages, registry, chat, on_event, confirm=None, audit=no_audit):
+async def run_turn(messages, registry, chat, on_event, confirm=None, audit=no_audit, max_rounds=MAX_TOOL_ROUNDS):
     """Return the messages this turn added. Text and tool starts reach on_event as they stream."""
     added = []
     after_outside = False
-    for round_number in range(MAX_TOOL_ROUNDS + 1):
-        out_of_rounds = round_number == MAX_TOOL_ROUNDS
+    for round_number in range(max_rounds + 1):
+        out_of_rounds = round_number == max_rounds
         options = {"tools": registry.schemas(), **({"tool_choice": "none"} if out_of_rounds else {})}
         content, calls = "", []
         async with contextlib.aclosing(chat(messages + added, **options)) as events:

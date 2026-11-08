@@ -5,6 +5,7 @@ models/
 *.log
 .venv-cosy/
 vendor/
+!static/vendor/
 voices/
 work/runtime-temp/
 work/agent-pytest*/

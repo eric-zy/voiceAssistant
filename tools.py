@@ -12,6 +12,7 @@ import httpx
 
 from api_config import auth_error, normalize_key
 from embedding import Embedder
+import usage
 import user_context
 
 log = logging.getLogger("uvicorn.error")
@@ -224,6 +225,7 @@ async def web_search(query):
                                      json={"query": text, "count": SEARCH_RESULTS})
     if response.status_code != 200:
         raise ToolError(auth_error(response.status_code))
+    usage.LEDGER.record_search(user_context.current().user_id)
     # No links: they are useless read aloud, and a summary is all the model needs.
     return {"note": OUTSIDE_NOTE, "results": [
         {"title": item.get("title", ""), "site": item.get("site_name"), "date": item.get("date"),

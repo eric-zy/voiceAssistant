@@ -10,7 +10,7 @@ from pathlib import Path
 import threading
 
 from knowledge import KnowledgeBase
-from memory_store import ActionLog, MemoryStore, ReminderStore
+from memory_store import ActionLog, MemoryStore, EnglishStore, ReminderStore, TaskStore
 from voice_clone import VoiceStore
 
 CURRENT = ContextVar("current_user")
@@ -27,6 +27,8 @@ class UserContext:
     action_log: ActionLog
     knowledge: KnowledgeBase
     voices: VoiceStore
+    tasks: TaskStore
+    english: EnglishStore
 
     def settings(self):
         """Personal settings; anything missing falls back to the server default."""
@@ -47,8 +49,12 @@ class UserContext:
 def build(user, root, embedder=None):
     root = Path(root)
     database = root / "agent.db"
+    tasks = TaskStore(database)
+    # A context is built once per user per process, so nothing of this user's can be running yet.
+    tasks.recover_interrupted()
     return UserContext(user["id"], user["email"], bool(user.get("is_admin")), root, MemoryStore(database), ReminderStore(database),
-                       ActionLog(database), KnowledgeBase(root / "knowledge", root / "knowledge.db", embedder), VoiceStore(root / "voices"))
+                       ActionLog(database), KnowledgeBase(root / "knowledge", root / "knowledge.db", embedder), VoiceStore(root / "voices"),
+                       tasks, EnglishStore(database))
 
 
 class ContextCache:

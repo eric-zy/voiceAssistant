@@ -35,7 +35,7 @@ class OpusDecoder:
         return b"".join(frame.to_ndarray().astype("<i2").tobytes() for frame in frames)
 
 
-def to_ogg_opus(wav_bytes):
+def to_ogg_opus(wav_bytes, metadata=None):
     """Ogg/Opus for a WAV reply, which browsers that announced support can decode directly."""
     with wave.open(io.BytesIO(wav_bytes), "rb") as source:
         rate, channels = source.getframerate(), source.getnchannels()
@@ -44,6 +44,7 @@ def to_ogg_opus(wav_bytes):
         samples = samples.reshape(-1, channels).mean(axis=1).astype("<i2")
     output = io.BytesIO()
     with av.open(output, "w", format="ogg") as container:
+        container.metadata.update({key: value for key, value in (metadata or {}).items() if value})
         stream = container.add_stream("libopus", rate=rate if rate in OPUS_RATES else 48000)
         stream.bit_rate = REPLY_BITRATE
         stream.layout = "mono"

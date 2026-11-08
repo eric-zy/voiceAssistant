@@ -1204,7 +1204,7 @@ def fake_sensevoice(monkeypatch, text, speech_peak=.98):
         def decode_stream(self, stream):
             pass
     monkeypatch.setattr(backend, "ASR_PROVIDER", "sensevoice")
-    monkeypatch.setattr(backend, "sense_model", Recognizer())
+    monkeypatch.setattr(backend, "sense_models", {"zh": Recognizer(), "en": Recognizer()})
     folder = Path(tempfile.mkdtemp())
     (folder / "model.int8.onnx").write_bytes(b"")
     monkeypatch.setattr(backend, "SENSEVOICE_DIR", folder)
@@ -1227,6 +1227,14 @@ def test_sensevoice_output_on_silence_is_dropped(monkeypatch):
 def test_sensevoice_traditional_output_becomes_simplified(monkeypatch):
     fake_sensevoice(monkeypatch, "這個季節")
     assert backend.transcribe(b"\0" * 6400) == "这个季节"
+
+
+def test_english_uses_its_own_recognizer_and_is_left_as_heard(monkeypatch):
+    fake_sensevoice(monkeypatch, "I'd like the chicken salad.")
+    english = backend.sense_models["en"]
+    calls = []
+    english.create_stream = lambda: calls.append("en") or type(backend.sense_models["zh"].create_stream())()
+    assert backend.transcribe(b"\0" * 6400, "en") == "I'd like the chicken salad." and calls == ["en"]
 
 
 def test_a_missing_sensevoice_model_says_how_to_get_it(monkeypatch, tmp_path):

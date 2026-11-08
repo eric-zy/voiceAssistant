@@ -31,14 +31,30 @@ class ToolCall:
     arguments: str
 
 
-async def stream_chat(base_url, api_key, model, messages, tools=None, tool_choice=None):
-    """Yield events as they arrive; raises RuntimeError with a message safe to show the user."""
-    body = {"model": model, "messages": messages, "stream": True,
-            "thinking": {"type": "disabled"}, "max_tokens": MAX_REPLY_TOKENS}
+async def stream_chat(base_url, api_key, model, messages, tools=None, tool_choice=None, on_usage=None,
+                      max_tokens=MAX_REPLY_TOKENS):
+    """Yield events as they arrive; raises RuntimeError with a message safe to show the user.
+
+    on_usage(usage) runs once for a request the server accepted: with DeepSeek's token counts, or with None
+    when the stream ended early (an interrupted reply) and the counts never arrived. Retried and refused
+    requests are not billed, so they are not reported.
+    """
+    body = {"model": model, "messages": messages, "stream": True, "stream_options": {"include_usage": True},
+            "thinking": {"type": "disabled"}, "max_tokens": max_tokens}
     if tools:
         body["tools"] = tools
     if tool_choice:
         body["tool_choice"] = tool_choice
+    state = {"accepted": False, "usage": None}
+    try:
+        async for event in _events(base_url, api_key, body, state):
+            yield event
+    finally:
+        if on_usage and state["accepted"]:
+            on_usage(state["usage"])
+
+
+async def _events(base_url, api_key, body, state):
     calls, announced, finish_reason = {}, set(), None
     async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=5)) as client:
         for delay in (*RETRY_DELAYS, None):
@@ -48,6 +64,7 @@ async def stream_chat(base_url, api_key, model, messages, tools=None, tool_choic
                 if not retry:
                     if response.status_code != 200:
                         raise RuntimeError(auth_error(response.status_code))
+                    state["accepted"] = True
                     async for line in response.aiter_lines():
                         if not line.startswith("data:"):
                             continue
@@ -57,6 +74,8 @@ async def stream_chat(base_url, api_key, model, messages, tools=None, tool_choic
                         chunk = json.loads(payload)
                         if chunk.get("error"):
                             raise RuntimeError("DeepSeek 返回错误，请检查账户及请求配置")
+                        # The last chunk carries the whole request's token counts, sometimes beside its final delta.
+                        state["usage"] = chunk.get("usage") or state["usage"]
                         choices = chunk.get("choices", [])
                         if not choices:
                             continue
