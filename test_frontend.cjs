@@ -696,3 +696,61 @@ test('uploading needs a file, sends it with the date, and opens the tasks panel'
   assert.equal(page.get('taskPanel').open,true);
   assert.match(page.get('meetingStatus').textContent,/已开始处理/);
 });
+
+function audioPage(tasks, replies={}) {
+  const elements = new Map(), calls = [];
+  const node = (tag) => ({tag,style:{},textContent:'',children:[],files:[],value:'',checked:false,disabled:false,open:false,hidden:false,
+    append(...items){this.children.push(...items);},replaceChildren(...items){this.children=items;},removeAttribute(name){delete this[name];}});
+  const get = id => { if (!elements.has(id)) elements.set(id,node('div')); return elements.get(id); };
+  const context = {$:get,document:{createElement:node},console,status(text){get('status').textContent=text;},
+    setTimeout:()=>0,clearTimeout(){},confirm:()=>true,
+    fetch:async(url,options={})=>{calls.push([options.method||'GET',url,options.body]);
+      const body = url==='/api/tasks' && !options.method ? {tasks} : (replies[url] || {});
+      return {ok:!body.detail,json:async()=>body};}};
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/tasks.js','utf8'),context);
+  vm.runInContext(fs.readFileSync(__dirname+'/static/audio.js','utf8'),context);
+  return {get,context,calls};
+}
+const SCRIPT_TASK = {id:3,kind:'audio_script',title:'兔子',status:'done',progress:'',error:'',seen:true,
+  result:{stage:'script',text:'从前有一只小兔子。',minutes:1,chars:9}};
+const AUDIO_TASK = {id:4,kind:'audio_render',title:'音频：兔子',status:'done',progress:'',error:'',seen:true,
+  result:{stage:'audio',text:'从前有一只小兔子。',audio:'ab.ogg',seconds:75,bytes:1048576}};
+
+test('a finished script can be edited and is voiced as edited',async()=>{
+  const page=audioPage([SCRIPT_TASK],{'/api/audio/render':{id:5}});
+  await tick();
+  const all=walk(page.get('taskList'));
+  const area=all.find(n=>n.tag==='textarea');
+  assert.equal(area.value,'从前有一只小兔子。');
+  area.value='从前有一只勇敢的小兔子。'; area.oninput();
+  assert.ok(all.some(n=>/^12 字，约 1 分钟/.test(n.textContent)));
+  await all.find(n=>n.textContent==='用当前音色合成').onclick();
+  assert.deepEqual(JSON.parse(page.calls.find(c=>c[1]==='/api/audio/render')[2]),{text:'从前有一只勇敢的小兔子。',title:'兔子'});
+});
+
+test('finished audio plays from the server, says it is AI-made, and deleting asks first',async()=>{
+  const page=audioPage([AUDIO_TASK]);
+  await tick();
+  const all=walk(page.get('taskList'));
+  assert.equal(all.find(n=>n.tag==='audio').src,'/api/audio/ab.ogg');
+  assert.ok(all.some(n=>n.textContent==='1 分 15 秒 · 1.0 MB · 开头有“本内容由 AI 合成”提示'));
+  assert.equal(all.find(n=>n.tag==='a').download,'音频：兔子.ogg');
+  page.context.confirm=()=>false;
+  await all.find(n=>n.textContent==='删除音频').onclick();
+  assert.equal(page.calls.some(c=>c[0]==='DELETE'),false);
+  page.context.confirm=()=>true;
+  await all.find(n=>n.textContent==='删除音频').onclick();
+  assert.deepEqual(page.calls.find(c=>c[0]==='DELETE').slice(0,2),['DELETE','/api/audio/ab.ogg']);
+});
+
+test('starting needs a topic and sends review as no render',async()=>{
+  const page=audioPage([],{'/api/audio/scripts':{id:1}});
+  await page.get('audioStart').onclick();
+  assert.equal(page.get('audioStatus').textContent,'请写一下主题');
+  Object.assign(page.get('audioTopic'),{value:'勇气'}); page.get('audioMinutes').value='5';
+  page.get('audioStyle').value='温柔'; page.get('audioReview').checked=true; page.get('audioSearch').checked=false;
+  await page.get('audioStart').onclick();
+  assert.deepEqual(JSON.parse(page.calls.find(c=>c[1]==='/api/audio/scripts')[2]),{topic:'勇气',minutes:5,style:'温柔',search:false,render:false});
+  assert.equal(page.get('taskPanel').open,true);
+});

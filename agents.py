@@ -38,6 +38,7 @@ class AgentSpec:
     max_rounds: int = 3
     max_yuan: float = 0.05
     model: str = ""  # empty means the server's default model
+    max_tokens: int = 512  # per reply; long writing needs more, and pays for it
 
     def __post_init__(self):
         for name in self.tools:
@@ -65,13 +66,16 @@ async def run_agent(spec, material, chat, user_id, default_model, task=""):
                 raise AgentStopped(f"{spec.name} 超出单次预算 {spec.max_yuan} 元，已停止")
             if usage.LEDGER.spent_today(user_id) >= DAILY_BUDGET_YUAN:
                 raise AgentStopped(f"今天的花费已到上限 {DAILY_BUDGET_YUAN} 元，明天再试")
-            return chat(model, messages, on_usage=lambda used: usage.LEDGER.record_chat(user_id, model, used), **options)
+            return chat(model, messages, on_usage=lambda used: usage.LEDGER.record_chat(user_id, model, used),
+                        max_tokens=spec.max_tokens, **options)
 
         async def ignore(event):
             pass
 
         system = {"role": "system", "content": spec.instructions + "当前时间：" + time.strftime("%Y-%m-%d %H:%M %A")}
-        user = {"role": "user", "content": (task + "\n\n" if task else "") + DATA_NOTE + "\n" + material[:MAX_INPUT_CHARS]}
+        # Material (a transcript, a draft, a web page) is marked as data; a task with no material is just the request.
+        body = DATA_NOTE + "\n" + material[:MAX_INPUT_CHARS] if material else ""
+        user = {"role": "user", "content": "\n\n".join(part for part in (task, body) if part)}
         added = await run_turn([system, user], spec.registry(), guarded, ignore, max_rounds=spec.max_rounds)
         return (added[-1].get("content") or "").strip()
     finally:

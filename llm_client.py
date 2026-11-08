@@ -31,7 +31,8 @@ class ToolCall:
     arguments: str
 
 
-async def stream_chat(base_url, api_key, model, messages, tools=None, tool_choice=None, on_usage=None):
+async def stream_chat(base_url, api_key, model, messages, tools=None, tool_choice=None, on_usage=None,
+                      max_tokens=MAX_REPLY_TOKENS):
     """Yield events as they arrive; raises RuntimeError with a message safe to show the user.
 
     on_usage(usage) runs once for a request the server accepted: with DeepSeek's token counts, or with None
@@ -39,7 +40,7 @@ async def stream_chat(base_url, api_key, model, messages, tools=None, tool_choic
     requests are not billed, so they are not reported.
     """
     body = {"model": model, "messages": messages, "stream": True, "stream_options": {"include_usage": True},
-            "thinking": {"type": "disabled"}, "max_tokens": MAX_REPLY_TOKENS}
+            "thinking": {"type": "disabled"}, "max_tokens": max_tokens}
     if tools:
         body["tools"] = tools
     if tool_choice:

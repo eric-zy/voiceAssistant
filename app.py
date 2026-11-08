@@ -35,6 +35,7 @@ from memory_store import ActionLog  # noqa: F401  (tests build per-user logs thr
 import tools as agent_tools
 from tools import default_registry
 import agents
+import audio_content
 import meeting
 import usage
 import user_context
@@ -364,6 +365,10 @@ async def synthesize(text: str) -> bytes:
     except Exception as error:
         # Cancellation propagates; network errors never trigger a hidden voice fallback.
         raise RuntimeError("edge-tts 合成失败，请检查网络、音色名称和语速配置；文字回复仍可使用") from error
+
+
+# Looked up per call so tests can replace synthesize; uses the voice of whoever the task belongs to.
+audio_content.SYNTHESIZE = lambda text: synthesize(text)
 
 
 async def synthesize_parts(text):
@@ -711,6 +716,75 @@ async def archive_meeting(request: Request, body: MeetingArchive):
         raise HTTPException(400, str(error)) from error
     context.action_log.record("upload_document", {"name": saved["name"]}, "meeting", "executed")
     return saved
+
+
+class AudioScriptRequest(BaseModel):
+    topic: str
+    minutes: int = 3
+    style: str = ""
+    search: bool = False
+    render: bool = False
+
+
+class AudioRenderRequest(BaseModel):
+    text: str
+    title: str = ""
+
+
+def submit_or_refuse(context, kind, title, payload):
+    if not API_KEY and kind != "audio_render":
+        raise HTTPException(400, "请设置 DEEPSEEK_API_KEY 环境变量后重启后端")
+    try:
+        return {"id": task_runner.submit(context, kind, title, payload)}
+    except agents.AgentStopped as error:
+        raise HTTPException(429, str(error)) from error
+
+
+@app.post("/api/audio/scripts")
+async def start_audio_script(request: Request, body: AudioScriptRequest):
+    """Writer and editor agents draft a script; with render it goes straight on to audio."""
+    context = require_user(request, write=True)
+    topic = body.topic.strip()
+    if not 2 <= len(topic) <= 500:
+        raise HTTPException(400, "主题要在 2 到 500 字之间")
+    if body.minutes not in audio_content.MINUTES:
+        raise HTTPException(400, "时长只能选 1、3、5、10 分钟")
+    payload = {"topic": topic, "minutes": body.minutes, "style": body.style.strip()[:30], "search": body.search, "render": body.render}
+    return submit_or_refuse(context, "audio_script", topic[:30], payload)
+
+
+@app.post("/api/audio/render")
+async def start_audio_render(request: Request, body: AudioRenderRequest):
+    """Voice a script the user has read and perhaps edited. No model is called, so no key is needed."""
+    context = require_user(request, write=True)
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(400, "稿子是空的")
+    if len(text) > audio_content.MAX_CHARS:
+        raise HTTPException(400, f"稿子超过 {audio_content.MAX_CHARS} 字（约 10 分钟），请删减")
+    title = body.title.strip()[:30] or text[:20]
+    return submit_or_refuse(context, "audio_render", "音频：" + title, {"text": text, "title": title})
+
+
+def audio_path(context, name):
+    path = context.root / "audio" / name
+    if not audio_content.AUDIO_NAME.match(name) or not path.is_file():
+        raise HTTPException(404, "没有这个音频")
+    return path
+
+
+@app.get("/api/audio/{name}")
+async def get_audio(request: Request, name: str):
+    context = require_user(request)
+    return FileResponse(audio_path(context, name), media_type="audio/ogg", filename="有声内容.ogg", content_disposition_type="inline")
+
+
+@app.delete("/api/audio/{name}")
+async def delete_audio(request: Request, name: str):
+    context = require_user(request, write=True)
+    audio_path(context, name).unlink()
+    context.action_log.record("delete_audio", {"name": name}, "page", "executed")
+    return {"ok": True}
 
 
 class TaskRequest(BaseModel):
