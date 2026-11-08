@@ -359,7 +359,7 @@ function connect() {
   };
 }
 function refreshHealth() { return fetch('/api/status').then(r=>r.json()).then(data=>{
-  $('health').textContent = `识别模型：${data.asr_ready?'已准备':'尚未下载，请运行 prepare_asr.py'}\nDeepSeek：${data.llm_model} · ${data.api_key_configured?'Key 已载入（不代表聊天调用成功）':'请设置 DEEPSEEK_API_KEY 后重启'}\n接口：${data.api_host || '未知'} · Key 指纹：${data.key_fingerprint || '旧版服务，请重启'}\n语音播报：${data.tts_provider || 'windows'} · ${data.tts_voice}${data.tts_provider==='edge'?' · 语速 '+data.tts_rate:''}${data.tts_provider==='cosyvoice'?' · '+({balanced:'短首句优先',stream:'流式播放',smooth:'完整回复连续播放'}[data.clone_playback] || '请重启聊天服务'):''}
+  $('health').textContent = `识别模型：${data.asr_provider || 'whisper'} · ${data.asr_ready?'已准备':'尚未下载，请运行 prepare_asr.py'}\nDeepSeek：${data.llm_model} · ${data.api_key_configured?'Key 已载入（不代表聊天调用成功）':'请设置 DEEPSEEK_API_KEY 后重启'}\n接口：${data.api_host || '未知'} · Key 指纹：${data.key_fingerprint || '旧版服务，请重启'}\n语音播报：${data.tts_provider || 'windows'} · ${data.tts_voice}${data.tts_provider==='edge'?' · 语速 '+data.tts_rate:''}${data.tts_provider==='cosyvoice'?' · '+({balanced:'短首句优先',stream:'流式播放',smooth:'完整回复连续播放'}[data.clone_playback] || '请重启聊天服务'):''}
 可用工具：${(data.tools || []).join('、') || '无'}`;
 }).catch(()=> $('health').textContent='状态检查失败'); }
 refreshHealth();

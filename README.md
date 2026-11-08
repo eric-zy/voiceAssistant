@@ -2,6 +2,12 @@
 
 当前工作目录统一为 `F:\wkspace\local_voice_chat`。音色改进见 [音色升级方案](音色升级方案.md)。
 
+## 语音识别
+
+默认用 SenseVoice Small（`models/sensevoice-small`），在 CPU 上运行。和原来的 Whisper base 相比，它在这台电脑的摄像头麦克风上能认出短口令，速度也快约 4 倍。没有人声时它会硬凑出一个“我”字，所以识别前先用 Silero 判断有没有人声。
+
+没有这个模型时自动改用 Whisper。想切回 Whisper，启动前设置 `$env:VOICE_ASR_PROVIDER = 'whisper'`。下载模型：`.venv/Scripts/python.exe prepare_asr.py --sensevoice`。服务重启后第一句话要多等几秒加载模型。对比两个模型：`work/compare_asr.py`。说明见 [语音识别解析](docs/语音识别SenseVoice解析.md)。
+
 ## 工具调用
 
 助手现在可以查询天气：问“北京明天下雨吗”，模型会调用 `get_weather`，查到后用口语回答。闲聊和常识问题不调用工具。

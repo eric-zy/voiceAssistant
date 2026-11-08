@@ -2,6 +2,8 @@ import dataclasses
 import json
 from datetime import datetime, timedelta
 import asyncio
+import tempfile
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 import time
@@ -200,6 +202,7 @@ def fake_whisper(monkeypatch, *pieces):
             return segments, None
     monkeypatch.setattr(backend, "asr_model", Model())
     monkeypatch.setattr(backend, "ASR_MODEL", str(backend.ROOT))
+    monkeypatch.setattr(backend, "ASR_PROVIDER", "whisper")
 
 
 def test_whisper_repeating_its_prompt_counts_as_hearing_nothing(monkeypatch):
@@ -227,6 +230,7 @@ def test_decoding_is_bounded_so_one_clip_cannot_block_the_rest(monkeypatch):
             return [], None
     monkeypatch.setattr(backend, "asr_model", Model())
     monkeypatch.setattr(backend, "ASR_MODEL", str(backend.ROOT))
+    monkeypatch.setattr(backend, "ASR_PROVIDER", "whisper")
     backend.transcribe(b"\0" * 6400)
     assert seen["temperature"] == 0
     assert seen["max_new_tokens"] <= 300
@@ -1181,3 +1185,69 @@ def test_a_path_cannot_escape_through_the_delete_route(tmp_path):
     with TestClient(backend.app) as client:
         assert client.delete("/api/knowledge/..%2Fsecret.md", headers=LOCAL).status_code == 404
     assert secret.exists()
+
+
+def fake_sensevoice(monkeypatch, text, speech_peak=.98):
+    """Stand-in recognizer; speech_peak is what Silero would report for the clip."""
+    heard = []
+
+    class Stream:
+        result = SimpleNamespace(text=text)
+
+        def accept_waveform(self, rate, samples):
+            heard.append((rate, len(samples)))
+
+    class Recognizer:
+        def create_stream(self):
+            return Stream()
+
+        def decode_stream(self, stream):
+            pass
+    monkeypatch.setattr(backend, "ASR_PROVIDER", "sensevoice")
+    monkeypatch.setattr(backend, "sense_model", Recognizer())
+    folder = Path(tempfile.mkdtemp())
+    (folder / "model.int8.onnx").write_bytes(b"")
+    monkeypatch.setattr(backend, "SENSEVOICE_DIR", folder)
+    monkeypatch.setattr(backend, "measure_speech", lambda pcm: (speech_peak, .5))
+    return heard
+
+
+def test_sensevoice_reads_speech_at_16khz(monkeypatch):
+    heard = fake_sensevoice(monkeypatch, "测试确认。")
+    assert backend.transcribe(b"\0" * 6400) == "测试确认。"
+    assert heard == [(16000, 3200)]
+
+
+def test_sensevoice_output_on_silence_is_dropped(monkeypatch):
+    # It answered 我 for silence, hum and clicks; Silero is what tells them apart.
+    heard = fake_sensevoice(monkeypatch, "我。", speech_peak=.11)
+    assert backend.transcribe(b"\0" * 6400) == "" and heard == []
+
+
+def test_sensevoice_traditional_output_becomes_simplified(monkeypatch):
+    fake_sensevoice(monkeypatch, "這個季節")
+    assert backend.transcribe(b"\0" * 6400) == "这个季节"
+
+
+def test_a_missing_sensevoice_model_says_how_to_get_it(monkeypatch, tmp_path):
+    monkeypatch.setattr(backend, "ASR_PROVIDER", "sensevoice")
+    monkeypatch.setattr(backend, "SENSEVOICE_DIR", tmp_path)
+    with pytest.raises(ValueError, match="--sensevoice"):
+        backend.transcribe(b"\0" * 6400)
+
+
+def test_status_names_the_recognizer(monkeypatch):
+    monkeypatch.setattr(backend, "ASR_PROVIDER", "sensevoice")
+    with TestClient(backend.app) as client:
+        assert client.get("/api/status").json()["asr_provider"] == "sensevoice"
+
+
+REAL_SENSEVOICE = backend.ROOT / "models" / "sensevoice-small" / "model.int8.onnx"
+
+
+@pytest.mark.skipif(not REAL_SENSEVOICE.is_file(), reason="SenseVoice model not downloaded")
+def test_the_real_sensevoice_hears_nothing_in_noise(monkeypatch):
+    import numpy as np
+    monkeypatch.setattr(backend, "ASR_PROVIDER", "sensevoice")
+    noise = (np.random.default_rng(0).standard_normal(32000) * 0.05 * 32767).astype("<i2").tobytes()
+    assert backend.transcribe(noise) == ""
