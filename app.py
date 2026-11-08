@@ -45,6 +45,10 @@ DEMO_AUDIO_DIR = ROOT / "data" / "heard"
 LATENCY_FILE = ROOT / "data" / "latency.jsonl"
 DEMO_AUDIO_KEPT = 40
 ASR_MODEL = os.getenv("VOICE_ASR_MODEL", str(ROOT / "models" / "whisper-base"))
+SENSEVOICE_DIR = ROOT / "models" / "sensevoice-small"
+# SenseVoice when its model is present; VOICE_ASR_PROVIDER=whisper switches back.
+ASR_PROVIDER = os.getenv("VOICE_ASR_PROVIDER", "").lower() or ("sensevoice" if (SENSEVOICE_DIR / "model.int8.onnx").is_file() else "whisper")
+SPEECH_PEAK_MIN = .5
 voice_store = VoiceStore(ROOT / "voices")
 saved_voice = voice_store.settings()
 TTS_PROVIDER = os.getenv("VOICE_TTS_PROVIDER", saved_voice.get("provider", "edge")).lower()
@@ -92,6 +96,7 @@ async def lifespan(application):
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 asr_model = None
+sense_model = None
 # Cancellation cannot stop CPU inference. A real thread lock prevents overlapping inference.
 import threading
 asr_lock = threading.Lock()
@@ -181,27 +186,55 @@ def keep_demo_audio(pcm):
 
 
 def transcribe(pcm: bytes) -> str:
-    global asr_model
     if len(pcm) % 2 or not 6400 <= len(pcm) <= MAX_BYTES:
         raise ValueError("录音应为 0.2～30 秒的 16kHz 单声道 PCM16")
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
     with asr_lock:
-        if not Path(ASR_MODEL).is_dir():
-            raise ValueError("尚未准备识别模型，请先运行 prepare_asr.py")
-        if asr_model is None:
-            from faster_whisper import WhisperModel
-            asr_model = WhisperModel(ASR_MODEL, device="cpu", compute_type="int8", local_files_only=True)
-        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-        # Default retries at rising temperatures took 12 s on a 0.8 s clip of leaked playback,
-        # holding asr_lock so every later sentence queued behind it. Decode once, bounded.
-        segments, _ = asr_model.transcribe(samples, language="zh", beam_size=3, vad_filter=True,
-                                           condition_on_previous_text=False, initial_prompt=SPEECH_PROMPT,
-                                           temperature=0, max_new_tokens=300, no_repeat_ngram_size=3)
-        text = "".join(segment.text for segment in segments if segment.no_speech_prob < NO_SPEECH_LIMIT).strip()
-        # Traditional output would never match the simplified reply when filtering out the speakers.
-        text = to_chinese_variant(text, "zh-cn")
-        # On unclear audio Whisper repeats all or part of its prompt instead of returning nothing.
-        words, prompt = re.sub(r"[\W_]+", "", text), re.sub(r"[\W_]+", "", SPEECH_PROMPT)
-        return "" if words in prompt or prompt in words else text
+        text = transcribe_sensevoice(pcm, samples) if ASR_PROVIDER == "sensevoice" else transcribe_whisper(samples)
+    # Traditional output would never match the simplified reply when filtering out the speakers.
+    return to_chinese_variant(text, "zh-cn")
+
+
+def transcribe_sensevoice(pcm, samples):
+    """SenseVoice Small via sherpa-onnx. On the webcam microphone it read 24/24 band-limited test phrases
+    where Whisper base read 14/24, in a quarter of the time.
+
+    It never returns nothing: silence, hum and clicks all came back as 我. Silero peaked at 0.11 or less on
+    those and 0.96 or more on every real recording, so a clip below SPEECH_PEAK_MIN is treated as silence.
+    """
+    global sense_model
+    if not (SENSEVOICE_DIR / "model.int8.onnx").is_file():
+        raise ValueError("尚未准备 SenseVoice 模型，请运行 prepare_asr.py --sensevoice")
+    if measure_speech(pcm)[0] < SPEECH_PEAK_MIN:
+        return ""
+    if sense_model is None:
+        import sherpa_onnx
+        # Fixed to Chinese: automatic detection read short Chinese replies as Japanese.
+        sense_model = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=str(SENSEVOICE_DIR / "model.int8.onnx"), tokens=str(SENSEVOICE_DIR / "tokens.txt"),
+            num_threads=2, language="zh", use_itn=True)
+    stream = sense_model.create_stream()
+    stream.accept_waveform(16000, samples)
+    sense_model.decode_stream(stream)
+    return stream.result.text.strip()
+
+
+def transcribe_whisper(samples):
+    global asr_model
+    if not Path(ASR_MODEL).is_dir():
+        raise ValueError("尚未准备识别模型，请先运行 prepare_asr.py")
+    if asr_model is None:
+        from faster_whisper import WhisperModel
+        asr_model = WhisperModel(ASR_MODEL, device="cpu", compute_type="int8", local_files_only=True)
+    # Default retries at rising temperatures took 12 s on a 0.8 s clip of leaked playback,
+    # holding asr_lock so every later sentence queued behind it. Decode once, bounded.
+    segments, _ = asr_model.transcribe(samples, language="zh", beam_size=3, vad_filter=True,
+                                       condition_on_previous_text=False, initial_prompt=SPEECH_PROMPT,
+                                       temperature=0, max_new_tokens=300, no_repeat_ngram_size=3)
+    text = "".join(segment.text for segment in segments if segment.no_speech_prob < NO_SPEECH_LIMIT).strip()
+    # On unclear audio Whisper repeats all or part of its prompt instead of returning nothing.
+    words, prompt = re.sub(r"[\W_]+", "", to_chinese_variant(text, "zh-cn")), re.sub(r"[\W_]+", "", SPEECH_PROMPT)
+    return "" if words in prompt or prompt in words else text
 
 
 def analyse_microphone(pcm: bytes):
@@ -331,7 +364,8 @@ async def status():
             display_voice = voice_store.get(CLONE_ID)["name"]
         except (ValueError, OSError, KeyError):
             display_voice = "参考音色缺失，请重新选择"
-    return {"asr_ready": (Path(ASR_MODEL) / "model.bin").is_file(), "llm_model": LLM_MODEL,
+    asr_ready = (SENSEVOICE_DIR / "model.int8.onnx").is_file() if ASR_PROVIDER == "sensevoice" else (Path(ASR_MODEL) / "model.bin").is_file()
+    return {"asr_ready": asr_ready, "asr_provider": ASR_PROVIDER, "llm_model": LLM_MODEL,
             "tts_voice": display_voice,
             "tts_provider": TTS_PROVIDER,
             "clone_playback": CLONE_PLAYBACK,

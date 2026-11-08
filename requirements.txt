@@ -7,5 +7,6 @@ websockets>=14,<17
 edge-tts>=7.2,<8
 python-multipart>=0.0.20,<1
 zhconv>=1.4,<2
+sherpa-onnx>=1.10,<2
 pypdf>=5,<7
 python-docx>=1.1,<2
