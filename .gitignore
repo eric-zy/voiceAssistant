@@ -13,3 +13,6 @@ outputs/*.wav
 outputs/*.mp3
 data/
 knowledge/
+.env
+deploy/certs/
+backups/

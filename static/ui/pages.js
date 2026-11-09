@@ -147,8 +147,30 @@ function SettingsPage() {
         h('p', {className: 'muted small'}, '查天气时没说地点就用它。'))),
     h(Card, {title: '服务状态', extra: h(Button, {size: 'sm', onClick: refreshHealth}, '重新检查')},
       state.status ? h('dl', {className: 'kv'}, UI.logic.healthLines(state.status).map(([key, value]) => h(Fragment, {key}, h('dt', null, key), h('dd', null, value))))
-        : h('p', {className: 'muted'}, '正在检查…')));
+        : h('p', {className: 'muted'}, '正在检查…')),
+    h(MetricsCard));
 }
+// For administrators: how the service is doing right now (recognition queue, request counts, latencies).
+const METRIC_NAMES = {asr: '识别', asr_wait: '识别排队', http_api: '接口请求', reply_asr_done: '回复：识别完成', reply_first_text: '回复：第一个字',
+  reply_first_audio: '回复：第一段语音', reply_llm_done: '回复：文字完成', reply_all_audio_sent: '回复：语音发完'};
+UI.logic.metricRows = data => Object.entries(data.latency).map(([name, item]) => [METRIC_NAMES[name] || name, String(item.n),
+  item.p50.toFixed(2) + ' 秒', item.p95.toFixed(2) + ' 秒', item.max.toFixed(2) + ' 秒']);
+function MetricsCard() {
+  // Only administrators get server details in /api/status; everyone else is not asked about metrics at all.
+  const admin = useStore(account).status?.server_pid !== undefined;
+  const [state, reload] = useAsync(() => admin ? api('/api/admin/metrics').catch(() => null) : Promise.resolve(null), [admin]);
+  const data = state.data;
+  if (!data) return null;
+  const limited = Object.entries(data.counts).filter(([name]) => name.startsWith('limited_')).map(([name, n]) => `${name.slice(8)} ${n} 次`).join('、');
+  return h(Card, {title: '运行情况（管理员）', extra: h(Button, {size: 'sm', onClick: reload}, '刷新')},
+    h('div', {className: 'stats'},
+      h(Stat, {label: '已运行', value: `${Math.floor(data.uptime_seconds / 3600)} 小时 ${Math.floor(data.uptime_seconds % 3600 / 60)} 分`}),
+      h(Stat, {label: '识别', value: `${data.recognition.running} / ${data.recognition.slots}`, hint: `正在识别 / 同时上限；排队 ${data.recognition.waiting}`}),
+      h(Stat, {label: '请求', value: String(data.counts.http_2xx || 0), hint: `出错 ${(data.counts.http_5xx || 0)} · 被拒 ${(data.counts.http_4xx || 0)}`})),
+    limited && h('p', {className: 'notice'}, '触发限流：' + limited),
+    h(Table, {columns: ['环节（最近 500 次）', '次数', '中位', '最慢 5%', '最慢'], rows: UI.logic.metricRows(data), empty: '还没有数据'}));
+}
+
 async function logout() { await fetch('/api/logout', {method: 'POST'}).catch(() => {}); location.replace('/'); }
 
 UI.pages.push(

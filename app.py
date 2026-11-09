@@ -39,6 +39,7 @@ from tools import default_registry
 import agents
 import audio_content
 import meeting
+import ops
 import practice
 import quiz
 import pronunciation
@@ -128,12 +129,27 @@ async def lifespan(application):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.middleware("http")
+async def count_requests(request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    metrics.count(f"http_{response.status_code // 100}xx")
+    if request.url.path.startswith("/api/"):
+        metrics.observe("http_api", time.perf_counter() - started)
+    return response
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 asr_model = None
 sense_models = {}
 # Cancellation cannot stop CPU inference. A real thread lock prevents overlapping inference.
 import threading
-asr_lock = threading.Lock()
+asr_lock = threading.Lock()  # Whisper only: one at a time
+model_lock = threading.Lock()  # loading a recognizer once, however many requests arrive together
+# How the service is doing, and what each account may do how often (ops.py).
+limiter = ops.RateLimiter()
+metrics = ops.Metrics()
+recognition_gate = ops.RecognitionGate(ops.recognition_slots())
 
 
 def is_own_voice(heard: str, playing: str) -> bool:
@@ -226,6 +242,8 @@ def current_city():
 
 def record_latency(timings, reply_chars, provider=""):
     """Stage timings for finding what is slow. Holds seconds and a length, never what was said."""
+    for stage, seconds in timings.items():
+        metrics.observe("reply_" + stage, seconds)
     try:
         LATENCY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LATENCY_FILE.open("a", encoding="utf-8") as file:
@@ -251,8 +269,15 @@ def transcribe(pcm: bytes, language: str = "zh") -> str:
     if len(pcm) % 2 or not 6400 <= len(pcm) <= MAX_BYTES:
         raise ValueError("录音应为 0.2～30 秒的 16kHz 单声道 PCM16")
     samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-    with asr_lock:
-        text = transcribe_sensevoice(pcm, samples, language) if ASR_PROVIDER == "sensevoice" else transcribe_whisper(samples, language)
+    with recognition_gate as gate:
+        metrics.observe("asr_wait", gate.waited)
+        started = time.perf_counter()
+        if ASR_PROVIDER == "sensevoice":
+            text = transcribe_sensevoice(pcm, samples, language)
+        else:
+            with asr_lock:
+                text = transcribe_whisper(samples, language)
+        metrics.observe("asr", time.perf_counter() - started)
     # Traditional output would never match the simplified reply when filtering out the speakers.
     return to_chinese_variant(text, "zh-cn") if language == "zh" else text
 
@@ -271,18 +296,24 @@ def transcribe_sensevoice(pcm, samples, language="zh"):
         raise ValueError("尚未准备 SenseVoice 模型，请运行 prepare_asr.py --sensevoice")
     if measure_speech(pcm)[0] < SPEECH_PEAK_MIN:
         return ""
-    if language not in sense_models:
-        import sherpa_onnx
-        # Fixed per language: automatic detection read short Chinese replies as Japanese. English keeps words
-        # as said (no "3" for "three"), which read-aloud checking compares against.
-        sense_models[language] = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=str(SENSEVOICE_DIR / "model.int8.onnx"), tokens=str(SENSEVOICE_DIR / "tokens.txt"),
-            num_threads=2, language=language, use_itn=language == "zh")
+    with model_lock:
+        if language not in sense_models:
+            sense_models[language] = load_sensevoice(language)
     sense_model = sense_models[language]
     stream = sense_model.create_stream()
     stream.accept_waveform(16000, samples)
     sense_model.decode_stream(stream)
     return stream.result.text.strip()
+
+
+def load_sensevoice(language):
+    """One recognizer per language, shared by every request (decoding several streams at once is safe)."""
+    import sherpa_onnx
+    # Fixed per language: automatic detection read short Chinese replies as Japanese. English keeps words
+    # as said (no "3" for "three"), which read-aloud checking compares against.
+    return sherpa_onnx.OfflineRecognizer.from_sense_voice(
+        model=str(SENSEVOICE_DIR / "model.int8.onnx"), tokens=str(SENSEVOICE_DIR / "tokens.txt"),
+        num_threads=2, language=language, use_itn=language == "zh")
 
 
 def transcribe_whisper(samples, language="zh"):
@@ -491,6 +522,7 @@ def signed_in(user):
 @app.post("/api/register")
 async def register(request: Request, credentials: Credentials):
     require_page_origin(request)
+    limit("auth", client_ip(request))
     if not OPEN_REGISTRATION:
         raise HTTPException(403, "暂未开放注册")
     try:
@@ -503,6 +535,7 @@ async def register(request: Request, credentials: Credentials):
 @app.post("/api/login")
 async def login(request: Request, credentials: Credentials):
     require_page_origin(request)
+    limit("auth", client_ip(request))
     try:
         user = await asyncio.to_thread(accounts.authenticate, credentials.email, credentials.password)
     except PermissionError as error:
@@ -553,6 +586,39 @@ async def save_settings(request: Request, settings: Settings):
         raise HTTPException(400, "城市名太长")
     context.save_settings({"default_city": city})
     return {"default_city": city}
+
+
+@app.get("/healthz")
+async def healthz():
+    """For the load balancer and Docker: is the process up and can it write its data? Says nothing else."""
+    try:
+        probe = ROOT / "data" / ".healthz"
+        probe.parent.mkdir(parents=True, exist_ok=True)
+        probe.write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        return Response(json.dumps({"ok": False}), status_code=503, media_type="application/json")
+    return {"ok": True}
+
+
+@app.get("/api/admin/metrics")
+async def admin_metrics(request: Request):
+    context = require_user(request)
+    if not context.is_admin:
+        raise HTTPException(403, "只有管理员能看")
+    return {**metrics.snapshot(), "recognition": {"slots": recognition_gate.size, "running": recognition_gate.active,
+                                                  "waiting": recognition_gate.waiting}}
+
+
+def limit(kind, key):
+    """Refuse with 429 and a readable wait when this key has done `kind` too often."""
+    retry = limiter.hit(kind, key)
+    if retry is not None:
+        metrics.count("limited_" + kind)
+        raise HTTPException(429, limiter.message(kind, retry), headers={"Retry-After": str(retry)})
+
+
+def client_ip(request):
+    return request.client.host if request.client else "unknown"
 
 
 @app.get("/api/status")
@@ -610,6 +676,7 @@ async def list_documents(request: Request):
 @app.post("/api/knowledge")
 async def upload_document(request: Request, file: UploadFile = File()):
     context = require_user(request, write=True)
+    limit("upload", context.user_id)
     # One past the limit is enough to reject it without holding an arbitrarily large upload.
     data = await file.read(MAX_DOCUMENT_BYTES + 1)
     try:
@@ -648,6 +715,7 @@ def probe_audio(path):
 async def upload_meeting(request: Request, file: UploadFile = File(), date: str = Form("")):
     """Save a recording under the user's own folder and start the notes task for it."""
     context = require_user(request, write=True)
+    limit("upload", context.user_id)
     if not API_KEY:
         raise HTTPException(400, "请设置 DEEPSEEK_API_KEY 环境变量后重启后端")
     original = Path(file.filename or "录音").name
@@ -786,6 +854,7 @@ def submit_or_refuse(context, kind, title, payload):
 async def start_audio_script(request: Request, body: AudioScriptRequest):
     """Writer and editor agents draft a script; with render it goes straight on to audio."""
     context = require_user(request, write=True)
+    limit("task", context.user_id)
     topic = body.topic.strip()
     if not 2 <= len(topic) <= 500:
         raise HTTPException(400, "主题要在 2 到 500 字之间")
@@ -799,6 +868,7 @@ async def start_audio_script(request: Request, body: AudioScriptRequest):
 async def start_audio_render(request: Request, body: AudioRenderRequest):
     """Voice a script the user has read and perhaps edited. No model is called, so no key is needed."""
     context = require_user(request, write=True)
+    limit("task", context.user_id)
     text = body.text.strip()
     if not text:
         raise HTTPException(400, "稿子是空的")
@@ -886,6 +956,7 @@ async def practice_say(request: Request, body: SayRequest):
     (edge-tts, free, sends the text to Microsoft) or the learner's own cloned voice (CosyVoice on this machine).
     The same sentence in the same voice is made once and kept, so replaying it costs nothing."""
     context = require_user(request, write=True)
+    limit("lookup", context.user_id)
     text = " ".join(body.text.split())
     if not 1 <= len(text) <= practice.MAX_SAY_CHARS or not practice.words(text):
         raise HTTPException(400, f"要读的句子需要是 1 到 {practice.MAX_SAY_CHARS} 字的英文")
@@ -946,6 +1017,7 @@ async def ask_agent(context, spec, material, task):
 async def english_translate(request: Request, body: TranslateRequest):
     """A Chinese translation of one sentence, made when first asked for and kept."""
     context = require_user(request, write=True)
+    limit("lookup", context.user_id)
     text = english_text(body.text, practice.MAX_SAY_CHARS)
     cache, key = LookupCache(context.root / "agent.db"), "zh:" + hashlib.sha1(text.encode("utf-8")).hexdigest()
     if (saved := await asyncio.to_thread(cache.get, key)) is not None:
@@ -964,6 +1036,7 @@ async def english_explain(request: Request, body: ExplainRequest):
     Looking something up means it was not understood, so it goes into the vocabulary book (once; looking it
     up again just counts it again)."""
     context = require_user(request, write=True)
+    limit("lookup", context.user_id)
     text = english_text(body.text, practice.MAX_LOOKUP_CHARS)
     around = " ".join(body.context.split())[:500]
     cache = LookupCache(context.root / "agent.db")
@@ -1003,6 +1076,7 @@ async def english_review(request: Request):
 async def english_quiz_start(request: Request):
     """A quiz from what is due: mistakes first, then whatever has waited longest, ten at most."""
     context = require_user(request, write=True)
+    limit("task", context.user_id)
     items = await asyncio.to_thread(context.english.due, quiz.MAX_QUESTIONS)
     if not items:
         due, upcoming = await asyncio.to_thread(context.english.due_count)
@@ -1085,7 +1159,8 @@ async def english_item_delete(request: Request, item_id: int):
 @app.post("/api/practice/read")
 async def practice_read(request: Request, audio: UploadFile = File(), target: str = Form()):
     """Read-aloud check: what the recognizer heard, word by word against the sentence. Runs locally, costs nothing."""
-    require_user(request, write=True)
+    context = require_user(request, write=True)
+    limit("lookup", context.user_id)
     target = target.strip()
     if not 1 <= len(target) <= 200 or not practice.words(target):
         raise HTTPException(400, "跟读句子要是 1 到 200 字的英文")
@@ -1103,6 +1178,7 @@ async def practice_read(request: Request, audio: UploadFile = File(), target: st
 async def practice_report_again(request: Request, session_id: int):
     """Ask again for a report, for a session whose report could not start when it ended."""
     context = require_user(request, write=True)
+    limit("task", context.user_id)
     session = await asyncio.to_thread(context.english.session, session_id)
     if not session or not session["ended_at"] or not session["transcript"]:
         raise HTTPException(404, "没有可总结的对话")
@@ -1124,6 +1200,7 @@ async def list_tasks(request: Request):
 @app.post("/api/tasks")
 async def submit_task(request: Request, body: TaskRequest):
     context = require_user(request, write=True)
+    limit("task", context.user_id)
     if len(json.dumps(body.input, ensure_ascii=False)) > agents.MAX_INPUT_CHARS:
         raise HTTPException(413, "内容太长")
     if not API_KEY:
@@ -1203,6 +1280,7 @@ async def voices(request: Request):
 @app.post("/api/voices")
 async def upload_voice(request: Request, name: str = Form(), prompt_text: str = Form(), audio: UploadFile = File()):
     context = require_user(request, write=True)
+    limit("upload", context.user_id)
     data = await audio.read(10 * 1024 * 1024 + 1)
     await audio.close()
     if len(data) > 10 * 1024 * 1024:
@@ -1276,6 +1354,7 @@ async def mic_test(request: Request):
 @app.post("/api/voice/preview")
 async def preview_voice(request: Request):
     context = require_user(request, write=True)
+    limit("lookup", context.user_id)
     task = asyncio.create_task(synthesize("你好，今天过得怎么样？"))
     try:
         while not task.done():
@@ -1590,7 +1669,7 @@ async def websocket(ws: WebSocket):
 
         try:
             if audio is not None:
-                await send("status", rid, text="正在识别…")
+                await send("status", rid, text=f"识别排队中，前面还有 {recognition_gate.queue_length() + 1} 句…" if recognition_gate.busy() else "正在识别…")
                 text = await (asyncio.to_thread(transcribe, audio, "en") if session else asyncio.to_thread(transcribe, audio))
                 spoken_pcm = audio
                 mark("asr_done")
@@ -1894,6 +1973,14 @@ async def websocket(ws: WebSocket):
                 practice_session["notes"] = [note for note in practice_session["notes"] if note.get("turn", turn) < turn]
                 await asyncio.to_thread(save_progress, practice_session)
                 await send("practice_rewound", rid, turn=turn, text=redo)
+            elif ((kind in {"text", "practice_start", "practice_resume"} or (kind == "audio_end" and recording and rid == request_id))
+                  and (turn_wait := limiter.hit("turn", context.user_id)) is not None):
+                # Too many questions too fast: say how long to wait; a recording in progress is dropped.
+                metrics.count("limited_turn")
+                await send("error", rid, text=limiter.message("turn", turn_wait))
+                if kind == "audio_end":
+                    recording = False
+                    pcm.clear()
             elif kind in {"interrupt", "text", "audio_start"}:
                 await stop()
                 request_id = rid

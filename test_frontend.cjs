@@ -713,3 +713,9 @@ test('review progress and the next review read naturally, and a used review word
   assert.equal(scheduleText({mastered:1}),'已掌握');
   assert.deepEqual(plain(reviewChips({used:['rough']})),[{label:'复习词',text:'用上了 rough，算一次复习',tone:'success'}]);
 });
+
+test('the admin metrics read as labelled rows',()=>{
+  const {metricRows}=uiContext(['pages.js']).UI.logic;
+  assert.deepEqual(plain(metricRows({latency:{asr:{n:12,p50:0.26,p95:0.96,max:1.2},custom:{n:1,p50:1,p95:1,max:1}}})),
+    [['识别','12','0.26 秒','0.96 秒','1.20 秒'],['custom','1','1.00 秒','1.00 秒','1.00 秒']]);
+});
