@@ -191,3 +191,15 @@ def test_the_page_gets_its_own_spend_and_only_an_admin_sees_everyone(user, monke
         assert {row["email"] for row in data["all"]["users"]} == {"#99", f"#{user.user_id}"}
         monkeypatch.setattr(user, "is_admin", False)
         assert "all" not in client.get("/api/usage").json()
+
+
+def test_a_backup_models_flat_price_has_no_off_peak_discount(monkeypatch):
+    from datetime import datetime
+    monkeypatch.setattr(usage, "FLAT_PRICES", {})
+    usage.set_flat_price("backup-model", {"hit": 1, "miss": 2, "output": 4})
+    night = datetime(2026, 11, 9, 3, tzinfo=usage.BEIJING)  # off-peak for DeepSeek
+    assert usage.chat_cost("backup-model", 1_000_000, 1_000_000, 1_000_000, night) == 7
+    assert usage.chat_cost("deepseek-flash", 0, 1_000_000, 0, night) == 1.0  # DeepSeek still halves at night
+    assert usage.chat_cost("unknown-model", 1, 1, 1, night) is None
+    with pytest.raises(ValueError):
+        usage.set_flat_price("bad", {"hit": 1})

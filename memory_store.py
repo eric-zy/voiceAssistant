@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import json
 import logging
 from pathlib import Path
-import sqlite3
+import db
 import time
 
 log = logging.getLogger("uvicorn.error")
@@ -18,6 +18,14 @@ REMINDER_SCHEMA = """CREATE TABLE IF NOT EXISTS reminders (
     id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, due_at TEXT NOT NULL, status TEXT NOT NULL,
     created_at TEXT NOT NULL, claimed_at TEXT, delivered_at TEXT)"""
 REPEATS = {"": "", "daily": "每天", "weekdays": "工作日", "weekly": "每周"}
+
+
+def _add_repeat_column(connection):
+    """SQLite databases made before repeating reminders get the column the first time they are opened.
+    (PostgreSQL tables are created with it.)"""
+    if "repeat" not in {row[1] for row in connection.execute("PRAGMA table_info(reminders)")}:
+        connection.execute("ALTER TABLE reminders ADD COLUMN repeat TEXT NOT NULL DEFAULT ''")
+        connection.commit()
 
 
 def next_occurrence(due, repeat, moment):
@@ -46,13 +54,11 @@ class ActionLog:
     """Every write a tool attempts, including refused ones. Stays on this machine."""
 
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = path if isinstance(path, db.Scope) else Path(path)
+        self.db = db.open_target(self.path, SCHEMA)
 
     def connect(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
-        connection.execute(SCHEMA)
-        return connection
+        return self.db.connect()
 
     def record(self, tool, arguments, source, outcome, detail=""):
         # A full disk should cost the log entry, not the user's reply.
@@ -61,7 +67,7 @@ class ActionLog:
                 connection.execute(
                     "INSERT INTO action_log (tool, args_json, source, outcome, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                     (tool, json.dumps(arguments, ensure_ascii=False), source, outcome, detail, now()))
-        except sqlite3.Error:
+        except db.Error:
             log.exception("could not write the action log")
 
     def recent(self, limit=50):
@@ -75,13 +81,11 @@ class MemoryStore:
     """Facts the user asked to keep. Forgetting is soft so it can be undone; clearing is final."""
 
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = path if isinstance(path, db.Scope) else Path(path)
+        self.db = db.open_target(self.path, MEMORY_SCHEMA)
 
     def connect(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
-        connection.execute(MEMORY_SCHEMA)
-        return connection
+        return self.db.connect()
 
     def add(self, content):
         with contextlib.closing(self.connect()) as connection, connection:
@@ -98,7 +102,7 @@ class MemoryStore:
             with contextlib.closing(self.connect()) as connection:
                 rows = connection.execute("SELECT id, content, created_at FROM memories WHERE deleted_at IS NULL "
                                           "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        except sqlite3.Error:
+        except db.Error:
             log.exception("could not read memories")
             return []
         return [{"id": row[0], "content": row[1], "created_at": row[2]} for row in reversed(rows)]
@@ -128,17 +132,11 @@ class ReminderStore:
     """pending -> claimed -> delivered, or cancelled. Times are naive local time."""
 
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = path if isinstance(path, db.Scope) else Path(path)
+        self.db = db.open_target(self.path, REMINDER_SCHEMA, upgrade=_add_repeat_column)
 
     def connect(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
-        connection.execute(REMINDER_SCHEMA)
-        # Databases made before repeating reminders get the column the first time they are opened.
-        if "repeat" not in {row[1] for row in connection.execute("PRAGMA table_info(reminders)")}:
-            connection.execute("ALTER TABLE reminders ADD COLUMN repeat TEXT NOT NULL DEFAULT ''")
-            connection.commit()
-        return connection
+        return self.db.connect()
 
     def add(self, content, due_at, repeat=""):
         if repeat not in REPEATS:
@@ -160,7 +158,7 @@ class ReminderStore:
             with contextlib.closing(self.connect()) as connection:
                 rows = connection.execute("SELECT id, content, due_at, repeat FROM reminders WHERE status IN ('pending', 'claimed') "
                                           "ORDER BY due_at LIMIT ?", (limit,)).fetchall()
-        except sqlite3.Error:
+        except db.Error:
             log.exception("could not read reminders")
             return []
         return [{"id": row[0], "content": row[1], "due_at": row[2], "repeat": row[3]} for row in rows]
@@ -221,13 +219,11 @@ class TaskStore:
     """
 
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = path if isinstance(path, db.Scope) else Path(path)
+        self.db = db.open_target(self.path, TASK_SCHEMA)
 
     def connect(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
-        connection.execute(TASK_SCHEMA)
-        return connection
+        return self.db.connect()
 
     @staticmethod
     def _task(row):
@@ -285,7 +281,7 @@ class TaskStore:
 
     def recover_interrupted(self):
         """At startup nothing can be running yet, so anything marked active was cut off by a restart."""
-        if not self.path.exists():  # a new user has nothing to recover; do not create files just to look
+        if not self.db.exists():  # a new user has nothing to recover; do not create files just to look
             return
         with contextlib.closing(self.connect()) as connection, connection:
             connection.execute("UPDATE agent_tasks SET status = 'failed', progress = '', error = '服务重启，任务中断，请重新提交', "
@@ -319,13 +315,11 @@ class EnglishStore:
     sentences once annotations arrive). Review progress lives on each item, ready for spaced-repetition quizzes."""
 
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = path if isinstance(path, db.Scope) else Path(path)
+        self.db = db.open_target(self.path, ENGLISH_SCHEMA + QUIZ_SCHEMA)
 
     def connect(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
-        connection.executescript(ENGLISH_SCHEMA)
-        return connection
+        return self.db.connect()
 
     @staticmethod
     def _session(row):
@@ -371,9 +365,9 @@ class EnglishStore:
         with contextlib.closing(self.connect()) as connection, connection:
             connection.execute(
                 "INSERT INTO english_items (kind, text, key, meaning, phonetic, note, context, session_id, created_at, due_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (kind, key) DO UPDATE SET seen_count = seen_count + 1, "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (kind, key) DO UPDATE SET seen_count = english_items.seen_count + 1, "
                 "meaning = excluded.meaning, note = excluded.note, context = excluded.context, session_id = excluded.session_id, "
-                "mastered = 0, due_at = MIN(due_at, excluded.due_at)",
+                "mastered = 0, due_at = CASE WHEN excluded.due_at < english_items.due_at THEN excluded.due_at ELSE english_items.due_at END",
                 (kind, text.strip()[:300], item_key(text)[:300], meaning[:300], phonetic[:60], note[:300], context[:300], session_id, stamp, local(datetime.now())))  # due now, in the format review queries compare
             return connection.execute("SELECT id FROM english_items WHERE kind = ? AND key = ?", (kind, item_key(text)[:300])).fetchone()[0]
 
@@ -410,13 +404,11 @@ class LookupCache:
     """Translations and explanations already paid for, so asking again costs nothing."""
 
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = path if isinstance(path, db.Scope) else Path(path)
+        self.db = db.open_target(self.path, CACHE_SCHEMA)
 
     def connect(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
-        connection.execute(CACHE_SCHEMA)
-        return connection
+        return self.db.connect()
 
     def get(self, key):
         with contextlib.closing(self.connect()) as connection:
@@ -425,7 +417,8 @@ class LookupCache:
 
     def set(self, key, value):
         with contextlib.closing(self.connect()) as connection, connection:
-            connection.execute("INSERT OR REPLACE INTO english_cache (key, value, created_at) VALUES (?, ?, ?)",
+            connection.execute("INSERT INTO english_cache (key, value, created_at) VALUES (?, ?, ?) "
+                               "ON CONFLICT (key) DO UPDATE SET value = excluded.value, created_at = excluded.created_at",
                                (key, json.dumps(value, ensure_ascii=False), now()))
 
 
@@ -491,13 +484,11 @@ def _english_review(cls):
 
     def create_quiz(self, questions):
         with contextlib.closing(self.connect()) as connection, connection:
-            connection.execute(QUIZ_SCHEMA)
             return connection.execute("INSERT INTO english_quizzes (created_at, questions_json) VALUES (?, ?)",
                                       (now(), json.dumps(questions, ensure_ascii=False))).lastrowid
 
     def quiz(self, quiz_id):
         with contextlib.closing(self.connect()) as connection:
-            connection.execute(QUIZ_SCHEMA)
             row = connection.execute("SELECT id, created_at, questions_json, answers_json, results_json, score, finished_at FROM english_quizzes WHERE id = ?",
                                      (quiz_id,)).fetchone()
         if not row:
@@ -514,7 +505,6 @@ def _english_review(cls):
 
     def quizzes(self, limit=10):
         with contextlib.closing(self.connect()) as connection:
-            connection.execute(QUIZ_SCHEMA)
             return [{"id": row[0], "created_at": row[1], "score": row[2], "finished_at": row[3], "count": len(json.loads(row[4]))}
                     for row in connection.execute("SELECT id, created_at, score, finished_at, questions_json FROM english_quizzes "
                                                   "WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT ?", (limit,))]
@@ -542,13 +532,11 @@ class ChatStore:
     """The assistant conversations: each a title and its turns, what was said and what was answered."""
 
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = path if isinstance(path, db.Scope) else Path(path)
+        self.db = db.open_target(self.path, CHAT_SCHEMA)
 
     def connect(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
-        connection.executescript(CHAT_SCHEMA)
-        return connection
+        return self.db.connect()
 
     def create(self, title):
         stamp = local(datetime.now())

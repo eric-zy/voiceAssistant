@@ -279,15 +279,30 @@ function MetricsCard() {
   const [state, reload] = useAsync(() => admin ? api('/api/admin/metrics').catch(() => null) : Promise.resolve(null), [admin]);
   const data = state.data;
   if (!data) return null;
+  const model = UI.logic.modelSummary(data);
   const limited = Object.entries(data.counts).filter(([name]) => name.startsWith('limited_')).map(([name, n]) => `${name.slice(8)} ${n} 次`).join('、');
   return h(Card, {title: '运行情况（管理员）', extra: h(Button, {size: 'sm', onClick: reload}, '刷新')},
     h('div', {className: 'stats'},
       h(Stat, {label: '已运行', value: `${Math.floor(data.uptime_seconds / 3600)} 小时 ${Math.floor(data.uptime_seconds % 3600 / 60)} 分`}),
       h(Stat, {label: '识别', value: `${data.recognition.running} / ${data.recognition.slots}`, hint: `正在识别 / 同时上限；排队 ${data.recognition.waiting}`}),
-      h(Stat, {label: '请求', value: String(data.counts.http_2xx || 0), hint: `出错 ${(data.counts.http_5xx || 0)} · 被拒 ${(data.counts.http_4xx || 0)}`})),
+      h(Stat, {label: '请求', value: String(data.counts.http_2xx || 0), hint: `出错 ${(data.counts.http_5xx || 0)} · 被拒 ${(data.counts.http_4xx || 0)}`}),
+      model && h(Stat, {label: '模型', value: model.value, hint: model.hint})),
     limited && h('p', {className: 'notice'}, '触发限流：' + limited),
     h(Table, {columns: ['环节（最近 500 次）', '次数', '中位', '最慢 5%', '最慢'], rows: UI.logic.metricRows(data), empty: '还没有数据'}));
 }
+
+// Which model service is answering: DeepSeek, or the backup while DeepSeek is paused after failures.
+const BREAKER_WORDS = {closed: '正常', open: '暂停中', 'half-open': '试探恢复'};
+UI.logic.modelSummary = data => {
+  const models = data.models || {};
+  const names = Object.keys(models);
+  if (!names.length) return null;
+  const counts = data.counts || {};
+  const switched = Object.entries(counts).filter(([name]) => name.startsWith('llm_failover_')).reduce((sum, [, n]) => sum + n, 0);
+  const primary = models[names[0]];
+  const value = names.length < 2 ? '无备用' : primary.state === 'closed' ? '主模型' : '备用模型';
+  return {value, hint: names.map(name => `${name} ${BREAKER_WORDS[models[name].state] || models[name].state}`).join(' · ') + ` · 切换过 ${switched} 次`};
+};
 
 UI.logic.passwordProblem = ({current, next, again}) => !current ? '请填写现在的密码' : next.length < 8 ? '新密码至少 8 位'
   : next.length > 128 ? '新密码最多 128 位' : next === current ? '新密码不能和现在的一样' : next !== again ? '两次输入的新密码不一样' : '';

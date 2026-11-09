@@ -1,7 +1,9 @@
 """Whose request is this? Each user gets a directory of their own, and code reaches it through current().
 
-Isolation is by directory: memories, reminders, the action log, knowledge files and voice samples of one user
-live under data/users/<id>/, so a query that forgets to filter cannot return another user's rows.
+Files (knowledge files and index, voice samples, recordings, settings) live under data/users/<id>/. Memories,
+reminders, the action log, tasks, English practice and chats live in that folder's agent.db with SQLite, or in
+PostgreSQL scoped to the user by row-level security (see db.py). Either way, a query that forgets to filter
+cannot return another user's rows.
 """
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -9,6 +11,7 @@ import json
 from pathlib import Path
 import threading
 
+import db
 from knowledge import KnowledgeBase
 from memory_store import ActionLog, ChatStore, MemoryStore, EnglishStore, ReminderStore, TaskStore
 from voice_clone import VoiceStore
@@ -49,7 +52,7 @@ class UserContext:
 
 def build(user, root, embedder=None):
     root = Path(root)
-    database = root / "agent.db"
+    database = db.target(root / "agent.db", user["id"])
     tasks = TaskStore(database)
     # A context is built once per user per process, so nothing of this user's can be running yet.
     tasks.recover_interrupted()

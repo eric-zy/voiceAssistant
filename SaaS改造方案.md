@@ -292,6 +292,8 @@ flowchart LR
 
 **结果（2026-11-08）**：代码和自动验证完成。实际采用每用户一个数据目录，仍用 SQLite，PostgreSQL 推迟到部署阶段，原因见 [S1 解析](docs/S1-账号与数据隔离解析.md)。
 
+**PostgreSQL（2026-11-08）**：已迁移。设置 `VOICE_DATABASE_URL` 后，账号、花费和每个用户的记忆、提醒、任务、英语、聊天都存在 PostgreSQL，表里加 `user_id`，用行级安全隔离；不设置时仍用 SQLite（开发和测试）。知识库索引仍是每用户一个 SQLite 文件。见 [PostgreSQL 迁移解析](docs/PostgreSQL迁移解析.md)。
+
 **验收**：
 
 - 两个账号同时使用，记忆、提醒、知识库、音色、操作日志都互不可见。

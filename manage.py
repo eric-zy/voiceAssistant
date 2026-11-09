@@ -2,9 +2,11 @@
 
   python manage.py create-admin you@example.com      create an administrator; the password is typed, hidden
   python manage.py import-legacy you@example.com     copy the single-user data into that account
+  python manage.py migrate-to-postgres               copy data/*.db and every user's agent.db into PostgreSQL
 
 import-legacy copies, never moves: data/agent.db, knowledge/ and voices/ stay where they are, and nothing
 already in the account is overwritten. The CosyVoice warm-up still reads voices/settings.json.
+migrate-to-postgres needs VOICE_DATABASE_URL and an empty database; the SQLite files are left in place.
 """
 import contextlib
 import getpass
@@ -14,6 +16,8 @@ import sys
 from pathlib import Path
 
 from accounts import AccountStore
+import db
+import pg_migrate
 
 ROOT = Path(__file__).resolve().parent
 ACCOUNTS = ROOT / "data" / "accounts.db"
@@ -62,8 +66,16 @@ def import_legacy(store, email, root=ROOT, users=USERS):
     target.mkdir(parents=True, exist_ok=True)
     copied = []
     legacy_db, account_db = root / "data" / "agent.db", target / "agent.db"
+    # Accounts in PostgreSQL mean the user's rows live there too; the store, not a global setting, says which.
+    if legacy_db.is_file() and isinstance(store.path, db.Scope):
+        scope = db.Scope(store.path.pool, user["id"])
+        if pg_migrate.has_user_rows(scope):
+            print("跳过记忆和提醒：账号里已经有了，不覆盖")
+        else:
+            pg_migrate.copy_user_db(legacy_db, scope)
+            copied.append("记忆、提醒和操作日志")
     # Signing in creates an empty database, which must not block the import; one with data is kept.
-    if legacy_db.is_file():
+    elif legacy_db.is_file():
         if account_db.exists() and has_rows(account_db):
             print("跳过记忆和提醒：账号里已经有了，不覆盖")
         else:
@@ -87,10 +99,18 @@ def import_legacy(store, email, root=ROOT, users=USERS):
 
 
 def main():
+    if sys.argv[1:] == ["migrate-to-postgres"]:
+        if not db.configured():
+            raise SystemExit("先设置 VOICE_DATABASE_URL（密码放在 PGPASSWORD 里）")
+        pg_migrate.migrate(ROOT / "data", db.pool())
+        print("导入完成。SQLite 文件还在原处，确认无误后可以自己移走")
+        return 0
     if len(sys.argv) != 3 or sys.argv[1] not in {"create-admin", "import-legacy"}:
         print(__doc__)
         return 1
-    store = AccountStore(ACCOUNTS)
+    if db.configured():
+        db.migrate()
+    store = AccountStore(db.target(ACCOUNTS))
     if sys.argv[1] == "create-admin":
         create_admin(store, sys.argv[2])
     else:
