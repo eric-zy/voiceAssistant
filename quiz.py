@@ -104,14 +104,34 @@ def parse_distractors(text):
     return result
 
 
+NEAR = "near"
+
+
+def one_edit_apart(a, b):
+    """True when one letter added, removed or changed turns a into b."""
+    if a == b or abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) > len(b):
+        a, b = b, a
+    for index, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return a[index + (len(a) == len(b)):] == b[index + 1:]
+    return True
+
+
 def grade_locally(question, answer):
-    """True or False when a rule decides; None when it takes judgement (the grader agent's job)."""
+    """True or False when a rule decides, NEAR for a spelling one letter off; None when it takes judgement (the
+    grader agent's job)."""
     kind = question["type"]
     if kind == "choice":
         return isinstance(answer, int) and not isinstance(answer, bool) and answer == question["expected"]
     answer = answer if isinstance(answer, str) else ""
     if kind in ("cloze", "spell"):
-        return normalize(answer) == normalize(question["expected"]) and bool(normalize(answer))
+        said, expected = normalize(answer), normalize(question["expected"])
+        if said and said == expected:
+            return True
+        # One letter off in a word of four or more letters: nearly right; the item neither moves up nor drops back.
+        return NEAR if said and len(expected) >= 4 and one_edit_apart(said, expected) else False
     if kind == "dictation":
         return practice.read_aloud(question["expected"], answer)["score"] >= DICTATION_PASS
     if not answer.strip():

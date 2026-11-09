@@ -126,7 +126,7 @@ UI.lookup = (() => {
     } catch (error) { if (popup && last === text) body.textContent = error.message; }
   }
   function onSelect(event) {
-    if (popup?.contains(event.target)) return;
+    if (event.target && popup?.contains(event.target)) return;
     setTimeout(() => {
       const selection = window.getSelection?.();
       const text = (selection?.toString() || '').replace(/\s+/g, ' ').trim();
@@ -137,12 +137,18 @@ UI.lookup = (() => {
       show(text, contextOf(box), selection.getRangeAt(0).getBoundingClientRect());
     }, 0);
   }
+  let settle = null;
+  function onSelectionChange() {
+    clearTimeout(settle);
+    settle = setTimeout(() => onSelect({target: null}), 700);
+  }
   if (typeof document.addEventListener === 'function') {
     document.addEventListener('mouseup', onSelect);
     document.addEventListener('touchend', onSelect);
+    if (window.matchMedia?.('(pointer: coarse)').matches) document.addEventListener('selectionchange', onSelectionChange);
     document.addEventListener('keydown', event => { if (event.key === 'Escape') close(); });
   }
-  return {show, close, contextOf};
+  return {show, close, contextOf, onSelect};
 })();
 
 // The live conversation in the dock is plain DOM owned by the engine, so this part is not React.
@@ -279,6 +285,7 @@ function resumeEnglish(sessionId, turn) {
 }
 
 UI.logic.scheduleText = item => item.mastered ? '已掌握' : item.tested ? `复习第 ${item.box} 级 · 答对 ${item.correct}/${item.tested} · 下次 ${format.when(item.due_at)}` : '还没复习过';
+UI.logic.resultLabel = result => result.near ? '≈ 基本对' : result.ok ? '✓ 对了' : '✗ 不对';
 const QUESTION_KIND = {correct: '改错：写出正确的说法', dictation: '听写：听一遍，写下来', translate: '翻译成中文',
   cloze: '填空：填上缺的词', spell: '看中文写英文', choice: '选出正确的意思'};
 UI.logic.nextReviewText = review => !review ? '' : review.mastered ? '已掌握，不再出题'
@@ -317,13 +324,44 @@ function QuizCard() {
         question.type === 'dictation' && h(SayButton, {text: question.say, voice: 'standard', label: '▶ 播放'}),
         question.hint && question.type !== 'dictation' && h('div', {className: 'muted small'}, (question.type === 'correct' ? '提示：' : '') + question.hint),
         h(QuestionInput, {question, value: quiz.answers[question.id], disabled: Boolean(quiz.result), onChange: value => setAnswer(question.id, value)}),
-        result && h('div', {className: 'q-result'}, h('strong', null, result.ok ? '✓ 对了' : '✗ 不对'),
+        result && h('div', {className: 'q-result'}, h('strong', null, UI.logic.resultLabel(result)),
           !result.ok && h('span', null, '  答案：' + result.expected),
           result.comment && h('div', {className: 'small'}, result.comment),
           h('div', {className: 'muted small'}, UI.logic.nextReviewText(result.review))));
     })),
     !quiz.result && h('div', {className: 'actions'}, h('span', {className: 'muted small grow'}, `已答 ${answered} / ${quiz.questions.length}，没答的算错`),
       h(Button, {kind: 'primary', disabled: busy, onClick: submit}, busy ? '批改中…' : '交卷')));
+}
+function QuizHistory() {
+  const [state] = useAsync(() => api('/api/english/quizzes'));
+  const [open, setOpen] = useState(null);
+  if (open) return h(QuizReview, {id: open, onBack: () => setOpen(null)});
+  const items = state.data?.quizzes || [];
+  if (!items.length) return h(Empty, {icon: 'tasks'}, state.loading ? '加载中…' : '还没有做过测验。');
+  return h('ul', {className: 'rows'}, items.map(item => h('li', {key: item.id, className: 'row clickable', onClick: () => setOpen(item.id)},
+    h('div', {className: 'grow'}, format.when(item.created_at)),
+    h(Badge, {tone: item.score === item.count ? 'success' : item.score >= item.count / 2 ? 'warn' : 'danger'}, `${item.score} / ${item.count}`),
+    h('span', {className: 'chevron'}, '›'))));
+}
+UI.logic.answerText = (question, answer) => question.type === 'choice' ? (Number.isInteger(answer) ? question.options[answer] : '（没答）')
+  : (typeof answer === 'string' && answer.trim() ? answer : '（没答）');
+function QuizReview({id, onBack}) {
+  const [state] = useAsync(() => api(`/api/english/quizzes/${id}`), [id]);
+  const data = state.data;
+  if (!data) return h('p', {className: 'muted'}, state.error || '加载中…');
+  const results = Object.fromEntries(data.results.map(result => [result.id, result]));
+  return h('div', null,
+    h('div', {className: 'viewer-head'}, h('strong', null, `${format.when(data.created_at)} · ${data.score} / ${data.questions.length}`),
+      h(Button, {size: 'sm', kind: 'ghost', onClick: onBack}, '返回')),
+    h('ol', {className: 'questions'}, data.questions.map(question => {
+      const result = results[question.id] || {};
+      return h('li', {key: question.id, className: 'question ' + (result.ok ? 'right' : 'wrong')},
+        h('div', {className: 'q-kind'}, QUESTION_KIND[question.type]),
+        h('div', {className: 'q-prompt'}, question.prompt || question.say),
+        h('div', {className: 'small'}, '你的答案：' + UI.logic.answerText(question, (data.answers || {})[String(question.id)])),
+        h('div', {className: 'q-result'}, h('strong', null, UI.logic.resultLabel(result)), !result.ok && h('span', null, '  答案：' + result.expected),
+          result.comment && h('div', {className: 'small'}, result.comment)));
+    })));
 }
 function Translation({text}) {
   const [state, setState] = useState({open: false, zh: '', busy: false});
@@ -349,7 +387,8 @@ function VocabBook() {
       item.note && h('div', {className: 'muted small'}, item.note),
       item.context && item.context !== item.text && h('div', {className: 'muted small'}, '原句：' + item.context),
       h('div', {className: 'muted small'}, UI.logic.scheduleText(item)),
-      h('div', {className: 'say-row'}, h(SayButton, {text: item.text, voice: 'standard', label: '▶ 读'}))),
+      h('div', {className: 'say-row'}, h(SayButton, {text: item.text, voice: 'standard', label: '▶ 标准读法'}),
+        h(SayButton, {text: item.text, voice: 'mine', label: '▶ 我的声音'}))),
     h(Button, {size: 'sm', onClick: () => act('POST', `/api/english/items/${item.id}/mastered`)}, '已掌握'),
     h(Button, {size: 'sm', kind: 'ghost', icon: 'trash', onClick: () => act('DELETE', `/api/english/items/${item.id}`)}, '删除'))));
 }
@@ -453,8 +492,9 @@ function EnglishPage() {
         h('div', {className: 'tabs'},
           h('button', {className: tab === 'history' ? 'active' : '', onClick: () => setTab('history')}, '对话记录'),
           h('button', {className: tab === 'vocab' ? 'active' : '', onClick: () => setTab('vocab')}, `生词本${vocabCount ? `（${vocabCount}）` : ''}`),
-          h('button', {className: tab === 'mistakes' ? 'active' : '', onClick: () => setTab('mistakes')}, `错题本${state.overview.counts.mistake ? `（${state.overview.counts.mistake}）` : ''}`)),
-        tab === 'history' ? h(SessionList) : tab === 'vocab' ? h(VocabBook) : h(MistakeBook))));
+          h('button', {className: tab === 'mistakes' ? 'active' : '', onClick: () => setTab('mistakes')}, `错题本${state.overview.counts.mistake ? `（${state.overview.counts.mistake}）` : ''}`),
+          h('button', {className: tab === 'quizzes' ? 'active' : '', onClick: () => setTab('quizzes')}, '测验')),
+        tab === 'history' ? h(SessionList) : tab === 'vocab' ? h(VocabBook) : tab === 'quizzes' ? h(QuizHistory) : h(MistakeBook))));
 }
 UI.taskDetails.practice_report = ({task}) => h('div', {className: 'prose'}, task.result.text);
 UI.pages.push({id: 'english', group: '智能体', title: '英语对话', icon: 'english', component: EnglishPage, order: 3});

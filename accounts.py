@@ -149,7 +149,26 @@ class AccountStore:
             row = connection.execute("SELECT id, email, is_admin FROM users WHERE email = ?", (normalize_email(email),)).fetchone()
         return self._user(row)
 
+    def change_password(self, user_id, current, new, keep_token=None):
+        """Replace a password after checking the current one. Every other session of the account is ended, so a
+        stolen session stops working; the one making the change (keep_token) stays signed in.
+        Returns False for a wrong current password; raises ValueError for an unusable new one."""
+        if not MIN_PASSWORD <= len(new or "") <= MAX_PASSWORD:
+            raise ValueError(f"新密码需要 {MIN_PASSWORD} 到 {MAX_PASSWORD} 位")
+        if new == current:
+            raise ValueError("新密码不能和现在的一样")
+        with contextlib.closing(self.connect()) as connection:
+            row = connection.execute("SELECT password FROM users WHERE id = ? AND disabled = 0", (user_id,)).fetchone()
+        if not row or not check_password(current or "", row[0]):
+            return False
+        kept = token_hash(keep_token) if keep_token else ""
+        with contextlib.closing(self.connect()) as connection, connection:
+            connection.execute("UPDATE users SET password = ? WHERE id = ?", (hash_password(new), user_id))
+            connection.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?", (user_id, kept))
+        return True
+
     def emails(self):
         """Every account's email by id, for the admin's spend table."""
         with contextlib.closing(self.connect()) as connection:
             return dict(connection.execute("SELECT id, email FROM users"))
+

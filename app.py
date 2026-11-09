@@ -1,5 +1,6 @@
 """Local ASR + DeepSeek text chat + configurable TTS. Run on loopback only."""
 import asyncio
+from datetime import datetime
 import base64
 import contextlib
 from difflib import SequenceMatcher
@@ -33,7 +34,7 @@ from fillers import FillerCache, PHRASE as FILLER_PHRASE
 from llm_client import ToolCallStarted, stream_chat
 from accounts import AccountStore
 from audio_codec import OpusDecoder, to_ogg_opus
-from memory_store import ITEM_KINDS, ActionLog, LookupCache  # noqa: F401  (tests build per-user logs through app)
+from memory_store import ITEM_KINDS, REPEATS, ActionLog, LookupCache  # noqa: F401  (tests build per-user logs through app)
 import tools as agent_tools
 from tools import default_registry
 import agents
@@ -555,6 +556,27 @@ async def logout(request: Request):
     return response
 
 
+class PasswordChange(BaseModel):
+    current: str
+    new: str
+
+
+@app.post("/api/account/password")
+async def change_password(request: Request, body: PasswordChange):
+    """Change one's own password; other signed-in devices are signed out, this one stays."""
+    context = require_user(request, write=True)
+    limit("auth", client_ip(request))
+    try:
+        changed = await asyncio.to_thread(accounts.change_password, context.user_id, body.current, body.new, request.cookies.get(SESSION_COOKIE))
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    if not changed:
+        context.action_log.record("change_password", {}, "page", "refused", "wrong current password")
+        raise HTTPException(403, "现在的密码不对")
+    context.action_log.record("change_password", {}, "page", "executed")
+    return {"ok": True}
+
+
 @app.get("/api/me")
 async def me(request: Request):
     context = require_user(request)
@@ -641,6 +663,37 @@ async def status(request: Request):
             "tts_rate": TTS_RATE, "tts_pitch": TTS_PITCH, "api_key_configured": bool(API_KEY),
             "voice_protocol": 5, "tools": list(default_registry.tools), "default_city": current_city(),
             "pronunciation": pronunciation.status(), "email": context.email, **server}
+
+
+class MemoryText(BaseModel):
+    content: str
+
+
+def memory_text(content):
+    text = " ".join(content.split())
+    if not 1 <= len(text) <= agent_tools.MAX_MEMORY_CHARS:
+        raise HTTPException(400, f"记忆要在 1 到 {agent_tools.MAX_MEMORY_CHARS} 字之间")
+    return text
+
+
+@app.post("/api/memories")
+async def add_memory(request: Request, body: MemoryText):
+    """Add a memory by typing it, as saying "记住……" would."""
+    context = require_user(request, write=True)
+    text = memory_text(body.content)
+    memory_id = await asyncio.to_thread(context.memories.add, text)
+    context.action_log.record("remember", {"content": text}, "page", "executed")
+    return {"id": memory_id, "content": text}
+
+
+@app.put("/api/memories/{memory_id}")
+async def edit_memory(request: Request, memory_id: int, body: MemoryText):
+    context = require_user(request, write=True)
+    text = memory_text(body.content)
+    if not await asyncio.to_thread(context.memories.update, memory_id, text):
+        raise HTTPException(404, "没有这条记忆")
+    context.action_log.record("edit_memory", {"memory_id": memory_id, "content": text}, "page", "executed")
+    return {"id": memory_id, "content": text}
 
 
 @app.get("/api/memories")
@@ -1097,6 +1150,24 @@ async def english_quiz_start(request: Request):
     return {"id": quiz_id, "questions": quiz.for_page(questions)}
 
 
+@app.get("/api/english/quizzes")
+async def english_quiz_history(request: Request):
+    """Finished quizzes, newest first, with their scores."""
+    context = require_user(request)
+    return {"quizzes": await asyncio.to_thread(context.english.quizzes, 30)}
+
+
+@app.get("/api/english/quizzes/{quiz_id}")
+async def english_quiz_detail(request: Request, quiz_id: int):
+    """One finished quiz: the questions, what was answered, and how each was graded."""
+    context = require_user(request)
+    saved = await asyncio.to_thread(context.english.quiz, quiz_id)
+    if not saved or not saved["finished_at"]:
+        raise HTTPException(404, "没有这次测验")
+    return {"id": saved["id"], "created_at": saved["created_at"], "score": saved["score"], "questions": quiz.for_page(saved["questions"]),
+            "answers": saved["answers"], "results": saved["results"]}
+
+
 class QuizAnswers(BaseModel):
     answers: dict
 
@@ -1120,16 +1191,57 @@ async def english_quiz_submit(request: Request, quiz_id: int, body: QuizAnswers)
     for question in questions:
         answer = answers.get(str(question["id"]))
         ok, comment = verdicts[question["id"]], ""
+        near = ok == quiz.NEAR
+        if near:
+            ok, comment = True, f"拼写差一个字母，正确是 {question['expected']}"
         if ok is None:
             grade = grades.get(question["id"])
             ok, comment = (grade["ok"], grade["comment"]) if grade else (quiz.closeness(question["expected"], answer) >= quiz.OPEN_PASS, "")
-        review = await asyncio.to_thread(context.english.record_review, question["item_id"], ok)
+        review = await asyncio.to_thread(context.english.record_review, question["item_id"], None if near else ok)
         expected = question["options"][question["expected"]] if question["type"] == "choice" else question["expected"]
-        results.append({"id": question["id"], "ok": ok, "expected": expected, "comment": comment, "review": review})
+        results.append({"id": question["id"], "ok": ok, "near": near, "expected": expected, "comment": comment, "review": review})
     score = sum(result["ok"] for result in results)
     if not await asyncio.to_thread(context.english.finish_quiz, quiz_id, answers, results, score):
         raise HTTPException(409, "这次测验已经交过了")
     return {"score": score, "total": len(results), "results": results}
+
+
+class ChatTitle(BaseModel):
+    title: str
+
+
+@app.get("/api/chats")
+async def list_chats(request: Request, q: str = ""):
+    """The assistant conversations, newest first; q finds those whose title or messages contain it."""
+    context = require_user(request)
+    return {"chats": await asyncio.to_thread(context.chats.list, q[:100])}
+
+
+@app.get("/api/chats/{chat_id}")
+async def get_chat(request: Request, chat_id: int):
+    context = require_user(request)
+    chat = await asyncio.to_thread(context.chats.get, chat_id)
+    if not chat:
+        raise HTTPException(404, "没有这次对话")
+    return chat
+
+
+@app.post("/api/chats/{chat_id}/title")
+async def rename_chat(request: Request, chat_id: int, body: ChatTitle):
+    context = require_user(request, write=True)
+    if not body.title.strip():
+        raise HTTPException(400, "标题不能为空")
+    if not await asyncio.to_thread(context.chats.rename, chat_id, body.title):
+        raise HTTPException(404, "没有这次对话")
+    return {"ok": True}
+
+
+@app.delete("/api/chats/{chat_id}")
+async def delete_chat(request: Request, chat_id: int):
+    context = require_user(request, write=True)
+    if not await asyncio.to_thread(context.chats.delete, chat_id):
+        raise HTTPException(404, "没有这次对话")
+    return {"ok": True}
 
 
 @app.get("/api/english/items")
@@ -1233,6 +1345,47 @@ async def cancel_task(request: Request, task_id: int):
 async def task_seen(request: Request, task_id: int):
     context = require_user(request, write=True)
     return {"ok": await asyncio.to_thread(context.tasks.mark_seen, task_id)}
+
+
+class ReminderForm(BaseModel):
+    content: str
+    due_at: str
+    repeat: str = ""
+
+
+def reminder_fields(body):
+    """The same checks the voice tool makes: some words, a real time in the future, a known way of repeating."""
+    text = " ".join(body.content.split())
+    if not 1 <= len(text) <= agent_tools.MAX_MEMORY_CHARS:
+        raise HTTPException(400, f"提醒内容要在 1 到 {agent_tools.MAX_MEMORY_CHARS} 字之间")
+    try:
+        due = agent_tools.parse_due(body.due_at)
+    except agent_tools.ToolError as error:
+        raise HTTPException(400, "时间格式不对") from error
+    if due <= datetime.now():
+        raise HTTPException(400, "这个时间已经过去了")
+    if body.repeat not in REPEATS:
+        raise HTTPException(400, "重复方式只能是每天、工作日或每周")
+    return text, due, body.repeat
+
+
+@app.post("/api/reminders")
+async def add_reminder(request: Request, body: ReminderForm):
+    context = require_user(request, write=True)
+    text, due, repeat = reminder_fields(body)
+    reminder_id = await asyncio.to_thread(context.reminders.add, text, due, repeat)
+    context.action_log.record("set_reminder", {"content": text, "due_at": body.due_at, "repeat": repeat}, "page", "executed")
+    return {"id": reminder_id}
+
+
+@app.put("/api/reminders/{reminder_id}")
+async def edit_reminder(request: Request, reminder_id: int, body: ReminderForm):
+    context = require_user(request, write=True)
+    text, due, repeat = reminder_fields(body)
+    if not await asyncio.to_thread(context.reminders.update, reminder_id, text, due, repeat):
+        raise HTTPException(404, "没有这条待办提醒")
+    context.action_log.record("edit_reminder", {"reminder_id": reminder_id, "content": text, "due_at": body.due_at, "repeat": repeat}, "page", "executed")
+    return {"id": reminder_id}
 
 
 @app.get("/api/reminders")
@@ -1394,6 +1547,7 @@ async def websocket(ws: WebSocket):
     decoder = None
     downlink_ogg = False
     history = Conversation()
+    chat_id = None  # the saved conversation this socket is adding to; one is created on the first answer
     finished_actions = []
     claimed = {}
     task = None
@@ -1647,6 +1801,18 @@ async def websocket(ws: WebSocket):
         with contextlib.suppress(Exception):
             await send("practice_stopped", None, session_id=session["id"], task_id=task_id, error=error, notes=len(session["notes"]))
 
+    async def save_chat_turn(rid, said, answered):
+        """Keep a finished turn of the assistant conversation, so it can be read and continued later."""
+        nonlocal chat_id
+        try:
+            if chat_id is None or not await asyncio.to_thread(context.chats.add_turn, chat_id, said, answered):
+                chat_id = await asyncio.to_thread(context.chats.create, said)
+                await asyncio.to_thread(context.chats.add_turn, chat_id, said, answered)
+            saved = await asyncio.to_thread(context.chats.get, chat_id)
+            await send("chat_saved", rid, chat_id=chat_id, title=saved["title"], turns=saved["turns"])
+        except Exception:
+            latency_log.exception("could not save the conversation")
+
     async def reply(rid, text=None, audio=None, source="text"):
         nonlocal spoken_audio
         worker = None
@@ -1848,6 +2014,9 @@ async def websocket(ws: WebSocket):
             else:
                 history.add_turn([user_message, *without_outside_results(added, default_registry)])
                 finished_actions.clear()
+                answered = (added[-1].get("content") or "").strip()
+                if answered and not demo:
+                    await save_chat_turn(rid, text, answered)
             await send("done", rid, tts_failed=tts_failed)
             record_latency(timings, len(added[-1].get("content") or ""), voice.provider)
         except asyncio.CancelledError:
@@ -1900,6 +2069,25 @@ async def websocket(ws: WebSocket):
                 detector = None
                 decoder = None
                 paused = interrupted = False
+                continue
+            if kind == "chat_new":
+                await stop()
+                history.turns.clear()
+                chat_id = None
+                await send("chat_started", None, chat_id=None)
+                continue
+            if kind == "chat_open":
+                opened = await asyncio.to_thread(context.chats.get, data.get("chat_id")) if isinstance(data.get("chat_id"), int) else None
+                if opened is None:
+                    await send("error", None, text="没有这次对话")
+                    continue
+                await stop()
+                history.turns.clear()
+                messages = opened["messages"]
+                for said, answered in zip(messages[::2], messages[1::2]):
+                    history.add_turn([{"role": "user", "content": said["text"]}, {"role": "assistant", "content": answered["text"]}])
+                chat_id = opened["id"]
+                await send("chat_started", None, chat_id=chat_id, title=opened["title"], messages=messages)
                 continue
             if kind == "practice_stop":
                 if practice_session is not None:

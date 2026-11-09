@@ -1,38 +1,104 @@
 <!doctype html>
-<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>登录 · 语音助手</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:#f3f6fa;color:#213047;font:16px/1.65 system-ui,"Microsoft YaHei",sans-serif}main{max-width:420px;margin:72px auto;padding:24px}h1{font-size:28px;margin:0 0 8px}p{color:#607088}.card{background:white;border:1px solid #dde5ef;border-radius:16px;padding:24px}label{display:block;font-size:14px;color:#516178;margin-top:14px}input{width:100%;border:1px solid #cad5e2;border-radius:9px;padding:12px;font:inherit;margin-top:6px}button{border:0;border-radius:9px;padding:12px 18px;background:#176858;color:white;cursor:pointer;font-size:15px;width:100%;margin-top:20px}button:disabled{opacity:.5}.switch{background:none;color:#176858;width:auto;padding:0;margin-top:16px;font-size:14px}#message{min-height:24px;margin-top:12px;color:#b3261e;font-size:14px}.hint{font-size:13px;color:#77859a}
-</style>
-<main><h1>语音助手</h1><p id="subtitle">登录后使用你自己的记忆、提醒、知识库和音色。</p>
-<form class="card" id="form">
-<label>邮箱<input id="email" type="email" autocomplete="username" required maxlength="254"></label>
-<label>密码<input id="password" type="password" autocomplete="current-password" required minlength="8" maxlength="128"></label>
-<button id="submit" type="submit">登录</button>
-<div id="message" role="alert"></div>
-<button class="switch" id="switch" type="button">还没有账号？注册</button>
-<p class="hint">密码至少 8 位。每个账号的数据彼此隔离，只有你自己能看到。</p>
-</form></main>
+:root{--ink:#1d2939;--muted:#667085;--line:#e4e8f0;--brand:#16735f;--brand-ink:#0f5546;--brand-soft:#e5f3ee;--danger:#c0392b}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%}
+body{background:#f4f6fb;color:var(--ink);font:15px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;display:flex;min-height:100vh}
+.side{flex:1;background:linear-gradient(160deg,#16735f,#0f5546 70%);color:#e9f6f1;padding:56px 48px;display:flex;flex-direction:column;justify-content:center}
+.brand{display:flex;gap:12px;align-items:center;font-size:22px;font-weight:700;color:#fff}
+.mark{display:grid;place-items:center;width:44px;height:44px;border-radius:12px;background:rgba(255,255,255,.15)}
+.side h2{font-size:28px;line-height:1.35;margin:36px 0 18px;color:#fff;max-width:420px}
+.side ul{list-style:none;padding:0;margin:0;display:grid;gap:12px;max-width:420px}
+.side li{display:flex;gap:10px;align-items:flex-start}.side li::before{content:"✓";color:#9fe3cf;font-weight:700}
+.main{flex:1;display:flex;align-items:center;justify-content:center;padding:32px 20px}
+.card{width:100%;max-width:400px;background:#fff;border:1px solid var(--line);border-radius:16px;box-shadow:0 2px 12px rgba(16,24,40,.06);padding:28px 28px 22px}
+h1{font-size:22px;margin:0 0 4px}.sub{color:var(--muted);margin:0 0 18px;font-size:14px}
+.tabs{display:flex;background:#f2f5f9;border-radius:10px;padding:4px;margin-bottom:18px}
+.tabs button{flex:1;border:0;background:none;padding:8px;border-radius:8px;cursor:pointer;font:inherit;color:var(--muted)}
+.tabs button.active{background:#fff;color:var(--brand-ink);font-weight:600;box-shadow:0 1px 3px rgba(16,24,40,.08)}
+label{display:block;font-size:13px;color:#475467;margin-top:12px}
+.field{position:relative;margin-top:6px}
+input{width:100%;border:1px solid #cfd6e2;border-radius:10px;padding:11px 12px;font:inherit;outline:none;transition:border-color .15s,box-shadow .15s}
+input:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(22,115,95,.15)}
+.show{position:absolute;right:8px;top:50%;transform:translateY(-50%);border:0;background:none;color:var(--muted);cursor:pointer;font-size:13px}
+.submit{width:100%;margin-top:20px;border:0;border-radius:10px;padding:12px;background:var(--brand);color:#fff;font:inherit;font-weight:600;cursor:pointer}
+.submit:hover:not(:disabled){background:var(--brand-ink)}.submit:disabled{opacity:.55;cursor:default}
+#message{min-height:22px;margin-top:10px;color:var(--danger);font-size:14px}
+.hint{font-size:12px;color:var(--muted);margin:10px 0 0}
+[hidden]{display:none!important}
+@media (max-width:820px){body{flex-direction:column}.side{padding:28px 22px;flex:none}.side h2{font-size:20px;margin:18px 0 10px}.side ul{display:none}}
+</style></head>
+<body>
+<section class="side">
+  <div class="brand"><span class="mark">🎙</span>语音助手</div>
+  <h2>说话就能用的个人助手，也是陪你练英语的伙伴</h2>
+  <ul>
+    <li>语音对话，记得你说过的事，到点提醒你</li>
+    <li>知识库、会议纪要、有声内容，后台 agent 帮你处理</li>
+    <li>自由英语对话，逐句指出问题，按遗忘规律复习</li>
+    <li>每个账号的数据彼此隔离，只有你自己能看到</li>
+  </ul>
+</section>
+<main class="main">
+<form class="card" id="form" novalidate>
+  <h1 id="title">欢迎回来</h1>
+  <p class="sub" id="subtitle">登录后使用你自己的记忆、提醒、知识库和音色。</p>
+  <div class="tabs" role="tablist">
+    <button type="button" id="tabLogin" class="active" role="tab">登录</button>
+    <button type="button" id="tabRegister" role="tab">注册</button>
+  </div>
+  <label for="email">邮箱</label>
+  <div class="field"><input id="email" type="email" autocomplete="username" required maxlength="254" placeholder="you@example.com"></div>
+  <label for="password">密码</label>
+  <div class="field"><input id="password" type="password" autocomplete="current-password" required minlength="8" maxlength="128">
+    <button type="button" class="show" id="show" aria-label="显示密码">显示</button></div>
+  <div id="againRow" hidden><label for="again">再输一次密码</label>
+    <div class="field"><input id="again" type="password" autocomplete="new-password" maxlength="128"></div></div>
+  <button class="submit" id="submit" type="submit">登录</button>
+  <div id="message" role="alert"></div>
+  <p class="hint" id="hint">忘记密码请联系管理员重置。</p>
+</form>
+</main>
 <script>
 const $ = id => document.getElementById(id);
 let registering = false;
-$('switch').onclick = () => {
-  registering = !registering;
-  $('submit').textContent = registering ? '注册并登录' : '登录';
-  $('switch').textContent = registering ? '已有账号？登录' : '还没有账号？注册';
-  $('password').autocomplete = registering ? 'new-password' : 'current-password';
+function mode(register) {
+  registering = register;
+  $('tabLogin').classList.toggle('active', !register); $('tabRegister').classList.toggle('active', register);
+  $('title').textContent = register ? '创建账号' : '欢迎回来';
+  $('submit').textContent = register ? '注册并登录' : '登录';
+  $('againRow').hidden = !register;
+  $('password').autocomplete = register ? 'new-password' : 'current-password';
+  $('hint').textContent = register ? '密码至少 8 位。注册即表示同意本服务的用户协议和隐私政策。' : '忘记密码请联系管理员重置。';
   $('message').textContent = '';
+}
+$('tabLogin').onclick = () => mode(false);
+$('tabRegister').onclick = () => mode(true);
+$('show').onclick = () => {
+  const hidden = $('password').type === 'password';
+  $('password').type = hidden ? 'text' : 'password'; $('show').textContent = hidden ? '隐藏' : '显示';
 };
+function problem() {
+  const email = $('email').value.trim(), password = $('password').value;
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return '请填写正确的邮箱';
+  if (password.length < 8) return '密码至少 8 位';
+  if (registering && password !== $('again').value) return '两次输入的密码不一样';
+  return '';
+}
 $('form').onsubmit = async event => {
   event.preventDefault();
+  const wrong = problem();
+  if (wrong) { $('message').textContent = wrong; return; }
   $('submit').disabled = true; $('message').textContent = '';
   try {
-    const response = await fetch(registering ? '/api/register' : '/api/login', {method:'POST',
-      headers:{'Content-Type':'application/json'}, body:JSON.stringify({email:$('email').value, password:$('password').value})});
+    const response = await fetch(registering ? '/api/register' : '/api/login', {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({email: $('email').value.trim(), password: $('password').value})});
     if (response.ok) { location.replace('/'); return; }
     const result = await response.json().catch(() => ({}));
     $('message').textContent = typeof result.detail === 'string' ? result.detail : '请检查邮箱和密码';
   } catch { $('message').textContent = '网络错误，请重试'; }
   $('submit').disabled = false;
 };
-</script></html>
+</script>
+</body></html>

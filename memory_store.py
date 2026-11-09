@@ -17,6 +17,18 @@ MEMORY_SCHEMA = """CREATE TABLE IF NOT EXISTS memories (
 REMINDER_SCHEMA = """CREATE TABLE IF NOT EXISTS reminders (
     id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, due_at TEXT NOT NULL, status TEXT NOT NULL,
     created_at TEXT NOT NULL, claimed_at TEXT, delivered_at TEXT)"""
+REPEATS = {"": "", "daily": "每天", "weekdays": "工作日", "weekly": "每周"}
+
+
+def next_occurrence(due, repeat, moment):
+    """The first time after `moment` that a repeating reminder comes round again, keeping its time of day."""
+    step = timedelta(days=7 if repeat == "weekly" else 1)
+    due = due + step
+    while due <= moment or (repeat == "weekdays" and due.weekday() >= 5):
+        due += step
+    return due
+
+
 # A page that claimed a reminder and then vanished must not lose it.
 CLAIM_EXPIRES_SECONDS = 60
 
@@ -75,6 +87,11 @@ class MemoryStore:
         with contextlib.closing(self.connect()) as connection, connection:
             return connection.execute("INSERT INTO memories (content, created_at) VALUES (?, ?)", (content, now())).lastrowid
 
+    def update(self, memory_id, content):
+        """Rewrite a memory; False if there is no such live memory."""
+        with contextlib.closing(self.connect()) as connection, connection:
+            return connection.execute("UPDATE memories SET content = ? WHERE id = ? AND deleted_at IS NULL", (content, memory_id)).rowcount > 0
+
     def recent(self, limit=50):
         """Newest last, reading like a list. A broken database means no memories, not a failed reply."""
         try:
@@ -117,22 +134,36 @@ class ReminderStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path)
         connection.execute(REMINDER_SCHEMA)
+        # Databases made before repeating reminders get the column the first time they are opened.
+        if "repeat" not in {row[1] for row in connection.execute("PRAGMA table_info(reminders)")}:
+            connection.execute("ALTER TABLE reminders ADD COLUMN repeat TEXT NOT NULL DEFAULT ''")
+            connection.commit()
         return connection
 
-    def add(self, content, due_at):
+    def add(self, content, due_at, repeat=""):
+        if repeat not in REPEATS:
+            raise ValueError("重复方式只能是每天、工作日或每周")
         with contextlib.closing(self.connect()) as connection, connection:
-            return connection.execute("INSERT INTO reminders (content, due_at, status, created_at) VALUES (?, ?, 'pending', ?)",
-                                      (content, local(due_at), now())).lastrowid
+            return connection.execute("INSERT INTO reminders (content, due_at, status, created_at, repeat) VALUES (?, ?, 'pending', ?, ?)",
+                                      (content, local(due_at), now(), repeat)).lastrowid
+
+    def update(self, reminder_id, content, due_at, repeat=""):
+        """Change a reminder that has not gone off yet; False if there is no such pending reminder."""
+        if repeat not in REPEATS:
+            raise ValueError("重复方式只能是每天、工作日或每周")
+        with contextlib.closing(self.connect()) as connection, connection:
+            return connection.execute("UPDATE reminders SET content = ?, due_at = ?, repeat = ?, status = 'pending', claimed_at = NULL "
+                                      "WHERE id = ? AND status IN ('pending', 'claimed')", (content, local(due_at), repeat, reminder_id)).rowcount > 0
 
     def pending(self, limit=20):
         try:
             with contextlib.closing(self.connect()) as connection:
-                rows = connection.execute("SELECT id, content, due_at FROM reminders WHERE status IN ('pending', 'claimed') "
+                rows = connection.execute("SELECT id, content, due_at, repeat FROM reminders WHERE status IN ('pending', 'claimed') "
                                           "ORDER BY due_at LIMIT ?", (limit,)).fetchall()
         except sqlite3.Error:
             log.exception("could not read reminders")
             return []
-        return [{"id": row[0], "content": row[1], "due_at": row[2]} for row in rows]
+        return [{"id": row[0], "content": row[1], "due_at": row[2], "repeat": row[3]} for row in rows]
 
     def claim_due(self, moment=None):
         """Take one due reminder for this page, or None. The conditional update lets only one page win."""
@@ -148,9 +179,17 @@ class ReminderStore:
                                      (local(moment), row[0], expired)).rowcount
         return {"id": row[0], "content": row[1], "due_at": row[2]} if won else None
 
-    def mark_delivered(self, reminder_id):
+    def mark_delivered(self, reminder_id, moment=None):
+        """Done, or for a repeating reminder, set for its next time."""
+        moment = moment or datetime.now()
         with contextlib.closing(self.connect()) as connection, connection:
-            connection.execute("UPDATE reminders SET status = 'delivered', delivered_at = ? WHERE id = ?", (now(), reminder_id))
+            row = connection.execute("SELECT due_at, repeat FROM reminders WHERE id = ?", (reminder_id,)).fetchone()
+            if row and row[1]:
+                upcoming = next_occurrence(datetime.fromisoformat(row[0]), row[1], moment)
+                connection.execute("UPDATE reminders SET status = 'pending', claimed_at = NULL, delivered_at = ?, due_at = ? WHERE id = ?",
+                                   (now(), local(upcoming), reminder_id))
+            else:
+                connection.execute("UPDATE reminders SET status = 'delivered', delivered_at = ? WHERE id = ?", (now(), reminder_id))
 
     def cancel(self, reminder_id):
         """Return the cancelled reminder, or None if there is nothing left to cancel."""
@@ -437,9 +476,12 @@ def _english_review(cls):
             row = connection.execute("SELECT box FROM english_items WHERE id = ?", (item_id,)).fetchone()
             if not row:
                 return None
-            box, due_at, mastered = next_review(row[0], correct, moment)
+            if correct is None:  # nearly right: stays at its box, asked again tomorrow
+                box, due_at, mastered = row[0], local(moment + timedelta(days=REVIEW_DAYS[1])), False
+            else:
+                box, due_at, mastered = next_review(row[0], correct, moment)
             connection.execute("UPDATE english_items SET box = ?, due_at = ?, mastered = ?, tested = tested + 1, correct = correct + ? WHERE id = ?",
-                               (box, due_at, int(mastered), int(correct), item_id))
+                               (box, due_at, int(mastered), int(bool(correct)), item_id))
         return {"box": box, "due_at": due_at, "mastered": mastered}
 
     def get_item(self, item_id):
@@ -483,3 +525,75 @@ def _english_review(cls):
 
 
 _english_review(EnglishStore)
+
+
+CHAT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    turns INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS chat_messages_chat ON chat_messages (chat_id, id);
+"""
+CHAT_TITLE_CHARS = 30
+
+
+class ChatStore:
+    """The assistant conversations: each a title and its turns, what was said and what was answered."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def connect(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.path)
+        connection.executescript(CHAT_SCHEMA)
+        return connection
+
+    def create(self, title):
+        stamp = local(datetime.now())
+        with contextlib.closing(self.connect()) as connection, connection:
+            return connection.execute("INSERT INTO chats (title, created_at, updated_at) VALUES (?, ?, ?)",
+                                      (" ".join(title.split())[:CHAT_TITLE_CHARS] or "新对话", stamp, stamp)).lastrowid
+
+    def add_turn(self, chat_id, said, answered):
+        stamp = local(datetime.now())
+        with contextlib.closing(self.connect()) as connection, connection:
+            if not connection.execute("SELECT 1 FROM chats WHERE id = ?", (chat_id,)).fetchone():
+                return False
+            connection.executemany("INSERT INTO chat_messages (chat_id, role, text, created_at) VALUES (?, ?, ?, ?)",
+                                   [(chat_id, "user", said, stamp), (chat_id, "assistant", answered, stamp)])
+            connection.execute("UPDATE chats SET updated_at = ?, turns = turns + 1 WHERE id = ?", (stamp, chat_id))
+        return True
+
+    def get(self, chat_id):
+        with contextlib.closing(self.connect()) as connection:
+            row = connection.execute("SELECT id, title, created_at, updated_at, turns FROM chats WHERE id = ?", (chat_id,)).fetchone()
+            if not row:
+                return None
+            messages = [{"role": role, "text": text, "at": at} for role, text, at in connection.execute(
+                "SELECT role, text, created_at FROM chat_messages WHERE chat_id = ? ORDER BY id", (chat_id,))]
+        return {"id": row[0], "title": row[1], "created_at": row[2], "updated_at": row[3], "turns": row[4], "messages": messages}
+
+    def list(self, query="", limit=50):
+        """Newest first; with a query, those whose title or any message contains it."""
+        with contextlib.closing(self.connect()) as connection:
+            if query.strip():
+                # A % or _ typed by the user is searched for as itself, not as a wildcard.
+                pattern = "%" + query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                rows = connection.execute(
+                    "SELECT id, title, created_at, updated_at, turns FROM chats WHERE title LIKE ? ESCAPE '\\' OR id IN "
+                    "(SELECT chat_id FROM chat_messages WHERE text LIKE ? ESCAPE '\\') ORDER BY updated_at DESC, id DESC LIMIT ?",
+                    (pattern, pattern, limit))
+            else:
+                rows = connection.execute("SELECT id, title, created_at, updated_at, turns FROM chats ORDER BY updated_at DESC, id DESC LIMIT ?", (limit,))
+            return [{"id": r[0], "title": r[1], "created_at": r[2], "updated_at": r[3], "turns": r[4]} for r in rows]
+
+    def rename(self, chat_id, title):
+        with contextlib.closing(self.connect()) as connection, connection:
+            return connection.execute("UPDATE chats SET title = ? WHERE id = ?", (" ".join(title.split())[:CHAT_TITLE_CHARS], chat_id)).rowcount > 0
+
+    def delete(self, chat_id):
+        with contextlib.closing(self.connect()) as connection, connection:
+            connection.execute("DELETE FROM chat_messages WHERE chat_id = ?", (chat_id,))
+            return connection.execute("DELETE FROM chats WHERE id = ?", (chat_id,)).rowcount > 0

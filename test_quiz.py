@@ -77,7 +77,8 @@ def test_rules_grade_what_they_can_and_leave_judgement_to_the_grader():
     choice = {"type": "choice", "expected": 2}
     assert quiz.grade_locally(choice, 2) is True and quiz.grade_locally(choice, 1) is False and quiz.grade_locally(choice, True) is False
     spell = {"type": "spell", "expected": "sounds rough"}
-    assert quiz.grade_locally(spell, "Sounds  rough!") is True and quiz.grade_locally(spell, "sound rough") is False
+    assert quiz.grade_locally(spell, "Sounds  rough!") is True and quiz.grade_locally(spell, "sound rough") == quiz.NEAR
+    assert quiz.grade_locally(spell, "looks rough") is False
     assert quiz.grade_locally(spell, "") is False
     dictation = {"type": "dictation", "expected": "Tell me what's going on."}
     assert quiz.grade_locally(dictation, "tell me what's going on") is True and quiz.grade_locally(dictation, "tell me going") is False
@@ -194,3 +195,48 @@ def test_due_words_go_to_the_partner_and_using_one_counts_as_a_review(user, mode
     assert user.english.get_item(word)["box"] == 1 and user.english.get_item(word)["correct"] == 1
     assert practice.used_words("Rough day! Roughly fine.", ["rough", "fine", "bad"]) == ["rough", "fine"]
     assert "rough, bold" in practice.partner_prompt("beginner", "", ["rough", "bold"])
+
+
+# Nearly right spelling, and looking back at finished quizzes
+
+@pytest.mark.parametrize("a,b,expected", [("weekday", "weekend", False), ("rouh", "rough", True), ("roughh", "rough", True),
+                                          ("rouhg", "rough", False), ("rough", "rough", False), ("cut", "cat", True), ("", "a", True)])
+def test_one_edit_apart(a, b, expected):
+    assert quiz.one_edit_apart(a, b) is expected
+
+
+def test_a_spelling_one_letter_off_is_nearly_right_only_for_longer_words():
+    assert quiz.grade_locally({"type": "spell", "expected": "weekend"}, "weekand") == quiz.NEAR
+    assert quiz.grade_locally({"type": "cloze", "expected": "rough"}, "Rough") is True
+    assert quiz.grade_locally({"type": "spell", "expected": "cat"}, "cut") is False
+    assert quiz.grade_locally({"type": "spell", "expected": "weekend"}, "") is False
+
+
+def test_nearly_right_keeps_the_item_where_it_was_and_asks_again_tomorrow(user):
+    word = user.english.add_item("word", "weekend", "周末")
+    user.english.record_review(word, True)
+    user.english.record_review(word, True, moment=datetime.now() + timedelta(days=2))      # box 2
+    review = user.english.record_review(word, None)
+    item = user.english.get_item(word)
+    assert item["box"] == 2 and item["tested"] == 3 and item["correct"] == 2 and not review["mastered"]
+    assert review["due_at"][:10] == (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def test_a_finished_quiz_can_be_looked_at_again_and_a_near_miss_is_reported(user, model):
+    store = user.english
+    store.add_item("word", "rough", "难熬的")          # id 1 -> choice? odd ids are choice; with no other items it becomes spell
+    with TestClient(backend.app) as client:
+        started = client.post("/api/english/quizzes", headers=ORIGIN).json()
+        question = started["questions"][0]
+        assert question["type"] in ("spell", "choice")
+        answer = "rugh" if question["type"] == "spell" else question["options"].index("难熬的")
+        graded = client.post(f"/api/english/quizzes/{started['id']}/submit", json={"answers": {str(question["id"]): answer}}, headers=ORIGIN).json()
+        if question["type"] == "spell":
+            assert graded["results"][0]["near"] is True and "正确是 rough" in graded["results"][0]["comment"]
+        history = client.get("/api/english/quizzes").json()["quizzes"]
+        assert history[0]["id"] == started["id"] and history[0]["count"] == 1
+        detail = client.get(f"/api/english/quizzes/{started['id']}").json()
+        assert detail["answers"] == {str(question["id"]): answer} and "expected" not in detail["questions"][0]
+        assert detail["results"][0]["expected"] in ("rough", "难熬的")
+        unfinished = client.post("/api/english/quizzes", headers=ORIGIN)
+        assert client.get("/api/english/quizzes/999").status_code == 404

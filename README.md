@@ -95,6 +95,8 @@ $env:VOICE_DEFAULT_CITY = '苏州'
 
 部署：`docker compose up -d --build`（应用 + nginx HTTPS），配置见 `.env.example`，步骤见 [deploy/README.md](deploy/README.md)；限流、识别并发、运行指标、备份和压测说明见 [S2 部署准备解析](docs/S2-部署准备解析.md)。
 
+对话历史、修改密码、记忆和提醒的手动编辑（含每天/工作日/每周重复）、会议页面录音等补充功能，见 [功能补充解析](docs/功能补充解析.md)。
+
 页面：前端用 React 18（单文件版本放在 static/vendor，无需构建），左侧菜单分为助手、我的资料、智能体、账户四组。
 
 后台任务：多个 agent 分工处理一个任务（口语陪练、会议记录、有声内容的底座），在“后台任务”面板看进度、取消、看结果。后台 agent 只能用只读工具，要改动的内容作为建议由你确认；每人同时一个任务，每天花费上限默认 2 元（`VOICE_DAILY_BUDGET_YUAN`）。说明见 [多 agent 框架解析](docs/多agent框架解析.md)。
