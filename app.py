@@ -31,8 +31,11 @@ from agent_loop import ToolResult, build_system_prompt, demo_chat, run_turn, wit
 from conversation import Conversation
 from knowledge import MAX_DOCUMENT_BYTES
 from fillers import FillerCache, PHRASE as FILLER_PHRASE
-from llm_client import ToolCallStarted, stream_chat
+import llm_client
+from llm_client import ToolCallStarted, stream_chat  # noqa: F401  (stream_chat: kept for scripts importing it here)
+import llm_router
 from accounts import AccountStore
+import db
 from audio_codec import OpusDecoder, to_ogg_opus
 from memory_store import ITEM_KINDS, REPEATS, ActionLog, LookupCache  # noqa: F401  (tests build per-user logs through app)
 import tools as agent_tools
@@ -54,9 +57,18 @@ ROOT = Path(__file__).resolve().parent
 DEEPSEEK_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 LLM_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 API_KEY = normalize_key(os.getenv("DEEPSEEK_API_KEY", ""))
+# A backup model service, tried when DeepSeek fails before its first word (OpenAI-compatible chat API). Unset: no backup.
+BACKUP_URL = os.getenv("VOICE_LLM_BACKUP_BASE_URL", "").strip().rstrip("/")
+BACKUP_KEY = normalize_key(os.getenv("VOICE_LLM_BACKUP_API_KEY", ""))
+BACKUP_MODEL = os.getenv("VOICE_LLM_BACKUP_MODEL", "").strip()
+# The backup's own request fields as JSON, e.g. {"thinking": {"type": "disabled"}} for a DeepSeek model on another host.
+BACKUP_EXTRA_BODY = json.loads(os.getenv("VOICE_LLM_BACKUP_EXTRA_BODY", "") or "{}")
+# Its price in yuan per million tokens, {"hit": .., "miss": .., "output": ..}; without it its calls show as unpriced.
+if BACKUP_MODEL and os.getenv("VOICE_LLM_BACKUP_PRICE", "").strip():
+    usage.set_flat_price(BACKUP_MODEL, json.loads(os.environ["VOICE_LLM_BACKUP_PRICE"]))
 DEFAULT_CITY = os.getenv("VOICE_DEFAULT_CITY", "合肥").strip()
 fillers = FillerCache()
-accounts = AccountStore(ROOT / "data" / "accounts.db")
+accounts = AccountStore(db.target(ROOT / "data" / "accounts.db"))
 contexts = user_context.ContextCache(ROOT / "data" / "users", agent_tools.knowledge_embedder)
 SESSION_COOKIE = "session"
 # Pages and sockets are accepted only from these origins; the hosts guard against DNS rebinding.
@@ -113,9 +125,20 @@ PCM_BYTES_PER_SECOND = 32000
 CLONE_BUSY_WAIT_SECONDS = 10
 REMINDER_POLL_SECONDS = 5
 latency_log = logging.getLogger("uvicorn.error")
+def llm_providers():
+    """DeepSeek first, then the backup if configured; read per call so configuration (and tests) can change it."""
+    return [llm_router.Provider("deepseek", DEEPSEEK_URL, API_KEY, LLM_MODEL, llm_client.DEEPSEEK_OPTIONS),
+            llm_router.Provider("backup", BACKUP_URL, BACKUP_KEY, BACKUP_MODEL, BACKUP_EXTRA_BODY)]
+
+
+llm = llm_router.Router(llm_providers, lambda: metrics)
+
+
 def agent_chat(model, messages, on_usage=None, **options):
-    """How background agents reach the model; looked up at call time so configuration changes apply."""
-    return stream_chat(DEEPSEEK_URL, API_KEY, model, messages, on_usage=on_usage, **options)
+    """How background agents reach the model: they are not listened to live, so the primary gets longer before the
+    backup is tried. on_usage(usage, model) learns which model answered."""
+    return llm.chat(messages, llm_router.BACKGROUND, primary_model=model,
+                    on_usage=(lambda provider, used: on_usage(used, provider.model)) if on_usage else None, **options)
 
 
 task_runner = agents.TaskRunner(agent_chat, lambda: LLM_MODEL)
@@ -124,6 +147,9 @@ NO_TOOLS = agent_tools.ToolRegistry([])
 
 @contextlib.asynccontextmanager
 async def lifespan(application):
+    # PostgreSQL: create or update tables and row-level security before the first request; a bad role stops startup.
+    if db.configured():
+        await asyncio.to_thread(db.migrate)
     with disconnect_logging(asyncio.get_running_loop()):
         yield
         await task_runner.shutdown()
@@ -612,12 +638,15 @@ async def save_settings(request: Request, settings: Settings):
 
 @app.get("/healthz")
 async def healthz():
-    """For the load balancer and Docker: is the process up and can it write its data? Says nothing else."""
+    """For the load balancer and Docker: is the process up, can it write its data and reach its database? Says
+    nothing else."""
     try:
         probe = ROOT / "data" / ".healthz"
         probe.parent.mkdir(parents=True, exist_ok=True)
         probe.write_text(str(time.time()), encoding="utf-8")
     except OSError:
+        return Response(json.dumps({"ok": False}), status_code=503, media_type="application/json")
+    if not await asyncio.to_thread(db.healthy):
         return Response(json.dumps({"ok": False}), status_code=503, media_type="application/json")
     return {"ok": True}
 
@@ -627,7 +656,7 @@ async def admin_metrics(request: Request):
     context = require_user(request)
     if not context.is_admin:
         raise HTTPException(403, "只有管理员能看")
-    return {**metrics.snapshot(), "recognition": {"slots": recognition_gate.size, "running": recognition_gate.active,
+    return {**metrics.snapshot(), "models": llm.status(), "recognition": {"slots": recognition_gate.size, "running": recognition_gate.active,
                                                   "waiting": recognition_gate.waiting}}
 
 
@@ -1072,7 +1101,7 @@ async def english_translate(request: Request, body: TranslateRequest):
     context = require_user(request, write=True)
     limit("lookup", context.user_id)
     text = english_text(body.text, practice.MAX_SAY_CHARS)
-    cache, key = LookupCache(context.root / "agent.db"), "zh:" + hashlib.sha1(text.encode("utf-8")).hexdigest()
+    cache, key = LookupCache(db.target(context.root / "agent.db", context.user_id)), "zh:" + hashlib.sha1(text.encode("utf-8")).hexdigest()
     if (saved := await asyncio.to_thread(cache.get, key)) is not None:
         return {"text": text, "zh": saved}
     zh = (await ask_agent(context, practice.TRANSLATOR, text, "请翻译：")).strip()
@@ -1092,7 +1121,7 @@ async def english_explain(request: Request, body: ExplainRequest):
     limit("lookup", context.user_id)
     text = english_text(body.text, practice.MAX_LOOKUP_CHARS)
     around = " ".join(body.context.split())[:500]
-    cache = LookupCache(context.root / "agent.db")
+    cache = LookupCache(db.target(context.root / "agent.db", context.user_id))
     key = "explain:" + hashlib.sha1(f"{text.lower()}|{around.lower()}".encode("utf-8")).hexdigest()
     result = await asyncio.to_thread(cache.get, key)
     if result is None:
@@ -1956,8 +1985,9 @@ async def websocket(ws: WebSocket):
                     finished_actions.append(f"{tool} {json.dumps(arguments, ensure_ascii=False)}")
 
             def chat(messages, **options):
-                return stream_chat(DEEPSEEK_URL, API_KEY, LLM_MODEL, messages, **options,
-                                   on_usage=lambda used: usage.LEDGER.record_chat(context.user_id, LLM_MODEL, used))
+                # Spoken as it streams: the backup is tried only if DeepSeek has said nothing within a few seconds.
+                return llm.chat(messages, llm_router.VOICE, **options,
+                                on_usage=lambda provider, used: usage.LEDGER.record_chat(context.user_id, provider.model, used))
 
             user_message = {"role": "user", "content": text}
             if session:

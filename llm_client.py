@@ -11,6 +11,14 @@ MAX_REPLY_TOKENS = 512
 # The API docs ask clients to wait and retry these. Nothing has streamed yet, so a retry is invisible.
 RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
 RETRY_DELAYS = (1, 2)
+# Worth trying another provider: this one is down, busy, out of credit or refusing the key. A 400 is not: the request
+# itself is wrong and would fail anywhere.
+FAILOVER_STATUSES = RETRY_STATUSES | {401, 402, 403}
+DEEPSEEK_OPTIONS = {"thinking": {"type": "disabled"}}
+
+
+class ProviderUnavailable(RuntimeError):
+    """This provider cannot answer now, though another might. The message is safe to show the user."""
 
 
 @dataclass(frozen=True)
@@ -32,38 +40,52 @@ class ToolCall:
 
 
 async def stream_chat(base_url, api_key, model, messages, tools=None, tool_choice=None, on_usage=None,
-                      max_tokens=MAX_REPLY_TOKENS):
+                      max_tokens=MAX_REPLY_TOKENS, retry_delays=RETRY_DELAYS, extra_body=DEEPSEEK_OPTIONS):
     """Yield events as they arrive; raises RuntimeError with a message safe to show the user.
 
     on_usage(usage) runs once for a request the server accepted: with DeepSeek's token counts, or with None
     when the stream ended early (an interrupted reply) and the counts never arrived. Retried and refused
     requests are not billed, so they are not reported.
+    extra_body holds one provider's own fields (DeepSeek's "thinking"); retry_delays () means fail at once, so a
+    caller with another provider can switch instead of waiting.
     """
     body = {"model": model, "messages": messages, "stream": True, "stream_options": {"include_usage": True},
-            "thinking": {"type": "disabled"}, "max_tokens": max_tokens}
+            **(extra_body or {}), "max_tokens": max_tokens}
     if tools:
         body["tools"] = tools
     if tool_choice:
         body["tool_choice"] = tool_choice
     state = {"accepted": False, "usage": None}
     try:
-        async for event in _events(base_url, api_key, body, state):
+        async for event in _events(base_url, api_key, body, state, tuple(retry_delays)):
             yield event
     finally:
         if on_usage and state["accepted"]:
             on_usage(state["usage"])
 
 
-async def _events(base_url, api_key, body, state):
+async def _events(base_url, api_key, body, state, retry_delays):
+    try:
+        async for event in _attempts(base_url, api_key, body, state, retry_delays):
+            yield event
+    except httpx.TransportError as error:
+        # Before anything arrived this is a provider that cannot be reached; after, the reply was cut off.
+        if state["accepted"]:
+            raise RuntimeError("模型回复中断了，请再说一次") from error
+        raise ProviderUnavailable("连不上模型服务，请稍后再试") from error
+
+
+async def _attempts(base_url, api_key, body, state, retry_delays):
     calls, announced, finish_reason = {}, set(), None
     async with httpx.AsyncClient(timeout=httpx.Timeout(180, connect=5)) as client:
-        for delay in (*RETRY_DELAYS, None):
+        for delay in (*retry_delays, None):
             async with client.stream("POST", base_url + "/chat/completions",
                 headers={"Authorization": "Bearer " + api_key}, json=body) as response:
                 retry = response.status_code in RETRY_STATUSES and delay is not None
                 if not retry:
                     if response.status_code != 200:
-                        raise RuntimeError(auth_error(response.status_code))
+                        error = ProviderUnavailable if response.status_code in FAILOVER_STATUSES else RuntimeError
+                        raise error(auth_error(response.status_code))
                     state["accepted"] = True
                     async for line in response.aiter_lines():
                         if not line.startswith("data:"):

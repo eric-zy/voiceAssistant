@@ -66,7 +66,8 @@ async def run_agent(spec, material, chat, user_id, default_model, task=""):
                 raise AgentStopped(f"{spec.name} 超出单次预算 {spec.max_yuan} 元，已停止")
             if usage.LEDGER.spent_today(user_id) >= DAILY_BUDGET_YUAN:
                 raise AgentStopped(f"今天的花费已到上限 {DAILY_BUDGET_YUAN} 元，明天再试")
-            return chat(model, messages, on_usage=lambda used: usage.LEDGER.record_chat(user_id, model, used),
+            # The router may answer from a backup; it then passes the model that answered, so the ledger prices that.
+            return chat(model, messages, on_usage=lambda used, answered=model: usage.LEDGER.record_chat(user_id, answered, used),
                         max_tokens=spec.max_tokens, **options)
 
         async def ignore(event):

@@ -1,6 +1,25 @@
 # Small trial deployment: the app behind nginx, which terminates HTTPS (browsers allow the microphone and
-# WebCodecs Opus only over HTTPS). Secrets come from .env, which is never committed (copy .env.example).
+# WebCodecs Opus only over HTTPS), with PostgreSQL for accounts, spend and every user's memories, reminders,
+# tasks, English practice and chats. Secrets come from .env, which is never committed (copy .env.example).
 services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: voice
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      VOICE_DB_PASSWORD: ${VOICE_DB_PASSWORD:?set VOICE_DB_PASSWORD in .env}   # read once by postgres-init.sh
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres-init.sh:/docker-entrypoint-initdb.d/10-voice.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d voice"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # No published port: only the app reaches the database.
+
   app:
     build: .
     image: local-voice-chat:latest
@@ -8,6 +27,11 @@ services:
     env_file: .env
     environment:
       FORWARDED_ALLOW_IPS: "*"   # only nginx can reach the app: it publishes no port of its own
+      VOICE_DATABASE_URL: postgresql://voice_app@db:5432/voice
+      PGPASSWORD: ${VOICE_DB_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
     volumes:
       - ./data:/app/data
       - ./models:/app/models:ro
@@ -27,3 +51,6 @@ services:
     volumes:
       - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ./deploy/certs:/etc/nginx/certs:ro
+
+volumes:
+  pgdata:

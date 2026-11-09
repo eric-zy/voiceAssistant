@@ -9,7 +9,7 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
-import sqlite3
+import db
 
 log = logging.getLogger("uvicorn.error")
 BEIJING = timezone(timedelta(hours=8))  # No daylight saving, so a fixed offset is exact.
@@ -21,6 +21,8 @@ PRICES = {
     "deepseek-v4-flash": {"hit": 0.04, "miss": 2.0, "output": 8.0},
     "deepseek-v4-pro": {"hit": 0.30, "miss": 9.0, "output": 27.0},
 }
+# Other hosts (the backup model) charge the same at every hour: no off-peak half price. Filled from configuration.
+FLAT_PRICES = {}
 SEARCH_YUAN = 0.005  # 5 yuan per 1,000 successful searches.
 # Which agent is spending, and an optional running total for one agent run, so a budget can stop it.
 CURRENT_AGENT = ContextVar("current_agent", default="main")
@@ -39,22 +41,29 @@ def is_peak(moment):
 
 def chat_cost(model, hit, miss, output, moment):
     """Yuan for one call, or None for a model with no known price (shown as unpriced, not as free)."""
-    price = PRICES.get(model)
-    if price is None:
+    if model in FLAT_PRICES:
+        price, factor = FLAT_PRICES[model], 1
+    elif model in PRICES:
+        price, factor = PRICES[model], 1 if is_peak(moment) else .5
+    else:
         return None
-    factor = 1 if is_peak(moment) else .5
     return (hit * price["hit"] + miss * price["miss"] + output * price["output"]) / 1e6 * factor
+
+
+def set_flat_price(model, price):
+    """Price a model that has no off-peak discount: {"hit": .., "miss": .., "output": ..} yuan per million tokens."""
+    if set(price) != {"hit", "miss", "output"} or not all(isinstance(value, (int, float)) and value >= 0 for value in price.values()):
+        raise ValueError("价格要写成 {\"hit\": 数字, \"miss\": 数字, \"output\": 数字}，单位是元/百万 tokens")
+    FLAT_PRICES[model] = dict(price)
 
 
 class UsageLedger:
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = path if isinstance(path, db.Scope) else Path(path)
+        self.db = db.open_target(self.path, SCHEMA)
 
     def connect(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
-        connection.execute(SCHEMA)
-        return connection
+        return self.db.connect()
 
     def _insert(self, user_id, kind, agent, model, moment, hit=0, miss=0, output=0, cost=None, complete=True):
         moment = (moment or datetime.now(BEIJING)).astimezone(BEIJING)
@@ -69,7 +78,7 @@ class UsageLedger:
                     " peak, cost_yuan, complete) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (user_id, moment.date().isoformat(), moment.isoformat(timespec="seconds"), kind, agent, model,
                      hit, miss, output, int(is_peak(moment)), cost, int(complete)))
-        except sqlite3.Error:
+        except db.Error:
             log.exception("could not write the usage ledger")
 
     def record_chat(self, user_id, model, usage, agent=None, moment=None):
@@ -107,7 +116,8 @@ class UsageLedger:
         month = today.replace(day=1).isoformat()
         where, args = ("WHERE user_id = ?", [user_id]) if user_id is not None else ("WHERE 1 = 1", [])
         columns = ("COUNT(*), COALESCE(SUM(cost_yuan), 0), SUM(hit_tokens), SUM(miss_tokens), SUM(output_tokens),"
-                   " SUM(kind = 'search'), SUM(complete = 0), SUM(cost_yuan IS NULL AND complete = 1)")
+                   " SUM(CASE WHEN kind = 'search' THEN 1 ELSE 0 END), SUM(CASE WHEN complete = 0 THEN 1 ELSE 0 END),"
+                   " SUM(CASE WHEN cost_yuan IS NULL AND complete = 1 THEN 1 ELSE 0 END)")
 
         def totals(row):
             calls, cost, hit, miss, output, searches, incomplete, unpriced = row
@@ -132,4 +142,4 @@ class UsageLedger:
         return result
 
 
-LEDGER = UsageLedger(Path(__file__).resolve().parent / "data" / "usage.db")
+LEDGER = UsageLedger(db.target(Path(__file__).resolve().parent / "data" / "usage.db"))

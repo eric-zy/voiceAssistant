@@ -720,6 +720,15 @@ test('the admin metrics read as labelled rows',()=>{
     [['识别','12','0.26 秒','0.96 秒','1.20 秒'],['custom','1','1.00 秒','1.00 秒','1.00 秒']]);
 });
 
+test('the admin card says which model service is answering and how often it switched',()=>{
+  const {modelSummary}=uiContext(['pages.js']).UI.logic;
+  assert.equal(modelSummary({counts:{}}), null);
+  assert.deepEqual(plain(modelSummary({models:{deepseek:{model:'deepseek-flash',state:'closed'}},counts:{}})),
+    {value:'无备用', hint:'deepseek 正常 · 切换过 0 次'});
+  assert.deepEqual(plain(modelSummary({models:{deepseek:{state:'open'},backup:{state:'closed'}},counts:{llm_failover_deepseek:4,http_2xx:9}})),
+    {value:'备用模型', hint:'deepseek 暂停中 · backup 正常 · 切换过 4 次'});
+});
+
 test('opening a saved conversation clears the chat area and shows its messages; saving marks it current',()=>{
   const ui=uiContext(['pages.js']);
   const shown=[];

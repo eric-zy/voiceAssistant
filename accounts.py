@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import re
 import secrets
-import sqlite3
+import db
 import threading
 import time
 from pathlib import Path
@@ -75,14 +75,12 @@ class LoginThrottle:
 
 class AccountStore:
     def __init__(self, path):
-        self.path = Path(path)
+        self.path = path if isinstance(path, db.Scope) else Path(path)
+        self.db = db.open_target(self.path, SCHEMA)
         self.throttle = LoginThrottle()
 
     def connect(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
-        connection.executescript(SCHEMA)
-        return connection
+        return self.db.connect()
 
     @staticmethod
     def _user(row):
@@ -96,7 +94,7 @@ class AccountStore:
             with contextlib.closing(self.connect()) as connection, connection:
                 user_id = connection.execute("INSERT INTO users (email, password, is_admin, created_at) VALUES (?, ?, ?, ?)",
                                              (email, hash_password(password), int(is_admin), time.strftime("%Y-%m-%dT%H:%M:%S%z"))).lastrowid
-        except sqlite3.IntegrityError as error:
+        except db.IntegrityError as error:
             raise ValueError("这个邮箱已经注册过") from error
         return {"id": user_id, "email": email, "is_admin": is_admin}
 
