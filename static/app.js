@@ -369,6 +369,8 @@ function connect() {
     if (message.type === 'memory_changed') { window.memoryChanged?.(message); return; }
     // Speaking practice: started, a correction for a sentence, ended. The tutor's replies use the usual path.
     if (message.type?.startsWith('practice_')) { window.practiceMessage?.(message); return; }
+    // Saved conversations: one was saved, opened or started fresh.
+    if (message.type?.startsWith('chat_')) { window.chatMessage?.(message); return; }
     // The server only sends this when idle. A new turn lets the usual reply path show and speak it.
     if (message.type === 'reminder_due') {
       const turn = nextTurn(); unlockAudio().catch(() => {}); replyActive = true;

@@ -1,0 +1,21 @@
+# Only code and static files go into the image; data, models, keys and local tooling stay out.
+.git
+.venv
+.venv-cosy
+__pycache__
+.pytest_cache
+data
+models
+voices
+knowledge
+outputs
+work
+vendor
+*.log
+.env
+HANDOFF*.md
+test_*.py
+test_frontend.cjs
+conftest.py
+deploy/certs
+backups

@@ -713,3 +713,67 @@ test('review progress and the next review read naturally, and a used review word
   assert.equal(scheduleText({mastered:1}),'已掌握');
   assert.deepEqual(plain(reviewChips({used:['rough']})),[{label:'复习词',text:'用上了 rough，算一次复习',tone:'success'}]);
 });
+
+test('the admin metrics read as labelled rows',()=>{
+  const {metricRows}=uiContext(['pages.js']).UI.logic;
+  assert.deepEqual(plain(metricRows({latency:{asr:{n:12,p50:0.26,p95:0.96,max:1.2},custom:{n:1,p50:1,p95:1,max:1}}})),
+    [['识别','12','0.26 秒','0.96 秒','1.20 秒'],['custom','1','1.00 秒','1.00 秒','1.00 秒']]);
+});
+
+test('opening a saved conversation clears the chat area and shows its messages; saving marks it current',()=>{
+  const ui=uiContext(['pages.js']);
+  const shown=[];
+  ui.context.bubble=(role,text)=>{shown.push([role,text]);return ui.node('div');};
+  ui.$('history').append(ui.node('div'));
+  ui.context.chatMessage({type:'chat_started',chat_id:4,title:'周末',messages:[{role:'user',text:'去哪玩'},{role:'assistant',text:'爬山'}]});
+  assert.equal(ui.$('history').children.length,1); assert.equal(ui.$('history').children[0].id,'empty');
+  assert.deepEqual(shown,[['user','去哪玩'],['assistant','爬山']]);
+  assert.equal(ui.run('chats.get().current'),4);
+  ui.context.chatMessage({type:'chat_saved',chat_id:9,title:'新',turns:1});
+  assert.equal(ui.run('chats.get().current'),9);
+  const evening=new Date(2026,10,8,23,30);   // late evening: already the next day in UTC
+  assert.equal(ui.UI.logic.chatWhen('2026-11-08T09:05:00',evening),'09:05');
+  assert.equal(ui.UI.logic.chatWhen('2026-01-02T09:05:00'),'01-02');
+});
+
+test('account, reminder, recording and quiz helpers read naturally',()=>{
+  const ui=uiContext(['pages.js','meetings.js','english.js']);
+  const {passwordProblem,defaultReminderTime,recordingName,resultLabel,answerText}=ui.UI.logic;
+  assert.equal(passwordProblem({current:'',next:'',again:''}),'请填写现在的密码');
+  assert.equal(passwordProblem({current:'a',next:'short',again:'short'}),'新密码至少 8 位');
+  assert.equal(passwordProblem({current:'old-pass1',next:'old-pass1',again:'old-pass1'}),'新密码不能和现在的一样');
+  assert.equal(passwordProblem({current:'old-pass1',next:'new-pass1',again:'new-pass2'}),'两次输入的新密码不一样');
+  assert.equal(passwordProblem({current:'old-pass1',next:'new-pass1',again:'new-pass1'}),'');
+  assert.equal(defaultReminderTime(new Date(2026,10,9,10,25)),'2026-11-09T11:00');
+  assert.equal(defaultReminderTime(new Date(2026,11,31,23,40)),'2027-01-01T00:00');
+  assert.equal(recordingName(new Date(2026,10,9,14,5)),'会议录音-2026-11-09-1405.webm');
+  assert.equal(resultLabel({ok:true,near:true}),'≈ 基本对'); assert.equal(resultLabel({ok:true}),'✓ 对了'); assert.equal(resultLabel({ok:false}),'✗ 不对');
+  assert.equal(answerText({type:'choice',options:['a','b']},1),'b'); assert.equal(answerText({type:'choice',options:['a']},undefined),'（没答）');
+  assert.equal(answerText({type:'spell'},' '),'（没答）'); assert.equal(answerText({type:'spell'},'rough'),'rough');
+});
+
+test('the page scripts share one global scope, so no two of them may declare the same top-level name',()=>{
+  // A clash is a SyntaxError that stops the later script from running at all (it once silenced the voice engine).
+  const names=file=>{const out=new Set();
+    for(const line of fs.readFileSync(file,'utf8').split('\n')){
+      const fn=line.match(/^(?:async\s+)?(?:function|class)\s+([A-Za-z_$][\w$]*)/); if(fn) out.add(fn[1]);
+      if(!/^(?:let|const|var)\s/.test(line)) continue;
+      let depth=0,current='';const parts=[];
+      for(const ch of line.replace(/^(?:let|const|var)\s+/,'')){
+        if('([{'.includes(ch)) depth++; if(')]}'.includes(ch)) depth--;
+        if((ch===','||ch===';')&&depth===0){parts.push(current);current='';if(ch===';')break;} else current+=ch;
+      }
+      parts.push(current);
+      for(const part of parts){const name=part.trim().match(/^([A-Za-z_$][\w$]*)/); if(name) out.add(name[1]);
+        const destructured=part.trim().match(/^\{([^}]*)\}/); if(destructured) destructured[1].split(',').forEach(x=>{const k=x.trim().split(':').pop().trim(); if(k) out.add(k);});}
+    }
+    return out;};
+  const html=fs.readFileSync(__dirname+'/static/index.html','utf8');
+  const files=[...html.matchAll(/src="\/static\/([^"?]+)/g)].map(m=>m[1]).filter(f=>!f.startsWith('vendor/'));
+  assert.ok(files.includes('app.js')&&files.includes('ui/meetings.js'));
+  const seen=new Map(), clashes=[];
+  for(const file of files) for(const name of names(__dirname+'/static/'+file)){
+    if(seen.has(name)) clashes.push(`${name}: ${seen.get(name)} and ${file}`); else seen.set(name,file);
+  }
+  assert.deepEqual(clashes,[]);
+});

@@ -98,6 +98,16 @@ details summary{cursor:pointer;color:#344054;margin:6px 0}
 .chip-danger{background:var(--danger-soft);color:var(--danger)}.chip-neutral{background:var(--soft);color:#475467}
 .turn-tools{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px;white-space:normal}
 .line-playing{outline:2px solid var(--brand);outline-offset:1px}.say-row{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
+.row.editing{background:var(--soft);border-radius:10px;padding:10px}.row.editing .reminder-form{flex:1}
+.recorder{display:flex;gap:16px;align-items:center}.recorder-time{font-size:28px;font-weight:700;font-variant-numeric:tabular-nums;min-width:110px}
+.recorder-level{flex:1;height:8px;background:var(--soft);border-radius:4px;overflow:hidden}.recorder-level span{display:block;height:100%;background:var(--brand);transition:width .3s}
+.password-form{display:grid;gap:8px;margin:8px 0 12px;padding:12px;background:var(--soft);border-radius:10px}.password-form .actions{margin-top:4px}
+.chat-layout{display:grid;grid-template-columns:280px minmax(0,1fr);gap:16px;align-items:start}
+.chat-list{position:sticky;top:20px;max-height:calc(100vh - 40px);overflow:auto;display:flex;flex-direction:column;gap:10px;margin-bottom:0}
+.chat-search{width:100%}.chat-row{padding:8px 6px}.chat-row.active{background:var(--brand-soft)}
+.chat-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.icon-button{border:0;background:none;color:var(--muted);cursor:pointer;padding:4px;border-radius:6px;display:none}
+.chat-row:hover .icon-button,.chat-row.active .icon-button{display:inline-flex}.icon-button:hover{background:#fff;color:var(--ink)}
 .review-line{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px;padding:10px 12px;background:var(--soft);border-radius:10px;font-size:14px}
 .quiz{border-color:#b9dccf}.questions{margin:0;padding-left:22px;display:flex;flex-direction:column;gap:14px}
 .question{padding:10px 12px;border-radius:10px;background:var(--soft)}.question.right{background:var(--success-soft)}.question.wrong{background:var(--danger-soft)}
@@ -130,6 +140,7 @@ details summary{cursor:pointer;color:#344054;margin:6px 0}
 .mic-settings{margin-top:6px;font-size:14px}.mic-settings select{max-width:100%}
 #vad,#micReport{font-size:13px;color:var(--muted);white-space:pre-wrap}
 @media (max-width:900px){
+.chat-layout{grid-template-columns:1fr}.chat-list{position:static;max-height:260px}.icon-button{display:inline-flex}
 .app{grid-template-columns:1fr}.topbar{display:flex;gap:10px;align-items:center;position:sticky;top:0;z-index:20;background:#fff;border-bottom:1px solid var(--line);padding:10px 14px}
 .menu-button{border:0;background:none;font-size:20px;cursor:pointer}
 .sidebar{position:fixed;left:0;top:0;z-index:40;width:250px;transform:translateX(-100%);transition:transform .2s}.sidebar.open{transform:none}
@@ -162,8 +173,8 @@ details summary{cursor:pointer;color:#344054;margin:6px 0}
   </div>
 </div></div>
 <script src="/static/vendor/react.production.min.js"></script><script src="/static/vendor/react-dom.production.min.js"></script>
-<script src="/static/ui/core.js?v=ui-5"></script><script src="/static/ui/pages.js?v=ui-5"></script><script src="/static/ui/voices.js?v=ui-5"></script>
-<script src="/static/ui/meetings.js?v=ui-5"></script><script src="/static/ui/audio.js?v=ui-5"></script><script src="/static/ui/english.js?v=ui-5"></script>
-<script src="/static/ui/shell.js?v=ui-5"></script>
-<script src="/static/speech.js?v=ui-5"></script><script src="/static/app.js?v=ui-5"></script>
+<script src="/static/ui/core.js?v=ui-14"></script><script src="/static/ui/pages.js?v=ui-14"></script><script src="/static/ui/voices.js?v=ui-14"></script>
+<script src="/static/ui/meetings.js?v=ui-14"></script><script src="/static/ui/audio.js?v=ui-14"></script><script src="/static/ui/english.js?v=ui-14"></script>
+<script src="/static/ui/shell.js?v=ui-14"></script>
+<script src="/static/speech.js?v=ui-14"></script><script src="/static/app.js?v=ui-14"></script>
 </body></html>

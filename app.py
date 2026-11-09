@@ -1,5 +1,6 @@
 """Local ASR + DeepSeek text chat + configurable TTS. Run on loopback only."""
 import asyncio
+from datetime import datetime
 import base64
 import contextlib
 from difflib import SequenceMatcher
@@ -33,12 +34,13 @@ from fillers import FillerCache, PHRASE as FILLER_PHRASE
 from llm_client import ToolCallStarted, stream_chat
 from accounts import AccountStore
 from audio_codec import OpusDecoder, to_ogg_opus
-from memory_store import ITEM_KINDS, ActionLog, LookupCache  # noqa: F401  (tests build per-user logs through app)
+from memory_store import ITEM_KINDS, REPEATS, ActionLog, LookupCache  # noqa: F401  (tests build per-user logs through app)
 import tools as agent_tools
 from tools import default_registry
 import agents
 import audio_content
 import meeting
+import ops
 import practice
 import quiz
 import pronunciation
@@ -128,12 +130,27 @@ async def lifespan(application):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.middleware("http")
+async def count_requests(request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    metrics.count(f"http_{response.status_code // 100}xx")
+    if request.url.path.startswith("/api/"):
+        metrics.observe("http_api", time.perf_counter() - started)
+    return response
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 asr_model = None
 sense_models = {}
 # Cancellation cannot stop CPU inference. A real thread lock prevents overlapping inference.
 import threading
-asr_lock = threading.Lock()
+asr_lock = threading.Lock()  # Whisper only: one at a time
+model_lock = threading.Lock()  # loading a recognizer once, however many requests arrive together
+# How the service is doing, and what each account may do how often (ops.py).
+limiter = ops.RateLimiter()
+metrics = ops.Metrics()
+recognition_gate = ops.RecognitionGate(ops.recognition_slots())
 
 
 def is_own_voice(heard: str, playing: str) -> bool:
@@ -226,6 +243,8 @@ def current_city():
 
 def record_latency(timings, reply_chars, provider=""):
     """Stage timings for finding what is slow. Holds seconds and a length, never what was said."""
+    for stage, seconds in timings.items():
+        metrics.observe("reply_" + stage, seconds)
     try:
         LATENCY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LATENCY_FILE.open("a", encoding="utf-8") as file:
@@ -251,8 +270,15 @@ def transcribe(pcm: bytes, language: str = "zh") -> str:
     if len(pcm) % 2 or not 6400 <= len(pcm) <= MAX_BYTES:
         raise ValueError("录音应为 0.2～30 秒的 16kHz 单声道 PCM16")
     samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-    with asr_lock:
-        text = transcribe_sensevoice(pcm, samples, language) if ASR_PROVIDER == "sensevoice" else transcribe_whisper(samples, language)
+    with recognition_gate as gate:
+        metrics.observe("asr_wait", gate.waited)
+        started = time.perf_counter()
+        if ASR_PROVIDER == "sensevoice":
+            text = transcribe_sensevoice(pcm, samples, language)
+        else:
+            with asr_lock:
+                text = transcribe_whisper(samples, language)
+        metrics.observe("asr", time.perf_counter() - started)
     # Traditional output would never match the simplified reply when filtering out the speakers.
     return to_chinese_variant(text, "zh-cn") if language == "zh" else text
 
@@ -271,18 +297,24 @@ def transcribe_sensevoice(pcm, samples, language="zh"):
         raise ValueError("尚未准备 SenseVoice 模型，请运行 prepare_asr.py --sensevoice")
     if measure_speech(pcm)[0] < SPEECH_PEAK_MIN:
         return ""
-    if language not in sense_models:
-        import sherpa_onnx
-        # Fixed per language: automatic detection read short Chinese replies as Japanese. English keeps words
-        # as said (no "3" for "three"), which read-aloud checking compares against.
-        sense_models[language] = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-            model=str(SENSEVOICE_DIR / "model.int8.onnx"), tokens=str(SENSEVOICE_DIR / "tokens.txt"),
-            num_threads=2, language=language, use_itn=language == "zh")
+    with model_lock:
+        if language not in sense_models:
+            sense_models[language] = load_sensevoice(language)
     sense_model = sense_models[language]
     stream = sense_model.create_stream()
     stream.accept_waveform(16000, samples)
     sense_model.decode_stream(stream)
     return stream.result.text.strip()
+
+
+def load_sensevoice(language):
+    """One recognizer per language, shared by every request (decoding several streams at once is safe)."""
+    import sherpa_onnx
+    # Fixed per language: automatic detection read short Chinese replies as Japanese. English keeps words
+    # as said (no "3" for "three"), which read-aloud checking compares against.
+    return sherpa_onnx.OfflineRecognizer.from_sense_voice(
+        model=str(SENSEVOICE_DIR / "model.int8.onnx"), tokens=str(SENSEVOICE_DIR / "tokens.txt"),
+        num_threads=2, language=language, use_itn=language == "zh")
 
 
 def transcribe_whisper(samples, language="zh"):
@@ -491,6 +523,7 @@ def signed_in(user):
 @app.post("/api/register")
 async def register(request: Request, credentials: Credentials):
     require_page_origin(request)
+    limit("auth", client_ip(request))
     if not OPEN_REGISTRATION:
         raise HTTPException(403, "暂未开放注册")
     try:
@@ -503,6 +536,7 @@ async def register(request: Request, credentials: Credentials):
 @app.post("/api/login")
 async def login(request: Request, credentials: Credentials):
     require_page_origin(request)
+    limit("auth", client_ip(request))
     try:
         user = await asyncio.to_thread(accounts.authenticate, credentials.email, credentials.password)
     except PermissionError as error:
@@ -520,6 +554,27 @@ async def logout(request: Request):
     response = Response(json.dumps({"ok": True}), media_type="application/json")
     response.delete_cookie(SESSION_COOKIE, path="/")
     return response
+
+
+class PasswordChange(BaseModel):
+    current: str
+    new: str
+
+
+@app.post("/api/account/password")
+async def change_password(request: Request, body: PasswordChange):
+    """Change one's own password; other signed-in devices are signed out, this one stays."""
+    context = require_user(request, write=True)
+    limit("auth", client_ip(request))
+    try:
+        changed = await asyncio.to_thread(accounts.change_password, context.user_id, body.current, body.new, request.cookies.get(SESSION_COOKIE))
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    if not changed:
+        context.action_log.record("change_password", {}, "page", "refused", "wrong current password")
+        raise HTTPException(403, "现在的密码不对")
+    context.action_log.record("change_password", {}, "page", "executed")
+    return {"ok": True}
 
 
 @app.get("/api/me")
@@ -555,6 +610,39 @@ async def save_settings(request: Request, settings: Settings):
     return {"default_city": city}
 
 
+@app.get("/healthz")
+async def healthz():
+    """For the load balancer and Docker: is the process up and can it write its data? Says nothing else."""
+    try:
+        probe = ROOT / "data" / ".healthz"
+        probe.parent.mkdir(parents=True, exist_ok=True)
+        probe.write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        return Response(json.dumps({"ok": False}), status_code=503, media_type="application/json")
+    return {"ok": True}
+
+
+@app.get("/api/admin/metrics")
+async def admin_metrics(request: Request):
+    context = require_user(request)
+    if not context.is_admin:
+        raise HTTPException(403, "只有管理员能看")
+    return {**metrics.snapshot(), "recognition": {"slots": recognition_gate.size, "running": recognition_gate.active,
+                                                  "waiting": recognition_gate.waiting}}
+
+
+def limit(kind, key):
+    """Refuse with 429 and a readable wait when this key has done `kind` too often."""
+    retry = limiter.hit(kind, key)
+    if retry is not None:
+        metrics.count("limited_" + kind)
+        raise HTTPException(429, limiter.message(kind, retry), headers={"Retry-After": str(retry)})
+
+
+def client_ip(request):
+    return request.client.host if request.client else "unknown"
+
+
 @app.get("/api/status")
 async def status(request: Request):
     context = require_user(request)
@@ -575,6 +663,37 @@ async def status(request: Request):
             "tts_rate": TTS_RATE, "tts_pitch": TTS_PITCH, "api_key_configured": bool(API_KEY),
             "voice_protocol": 5, "tools": list(default_registry.tools), "default_city": current_city(),
             "pronunciation": pronunciation.status(), "email": context.email, **server}
+
+
+class MemoryText(BaseModel):
+    content: str
+
+
+def memory_text(content):
+    text = " ".join(content.split())
+    if not 1 <= len(text) <= agent_tools.MAX_MEMORY_CHARS:
+        raise HTTPException(400, f"记忆要在 1 到 {agent_tools.MAX_MEMORY_CHARS} 字之间")
+    return text
+
+
+@app.post("/api/memories")
+async def add_memory(request: Request, body: MemoryText):
+    """Add a memory by typing it, as saying "记住……" would."""
+    context = require_user(request, write=True)
+    text = memory_text(body.content)
+    memory_id = await asyncio.to_thread(context.memories.add, text)
+    context.action_log.record("remember", {"content": text}, "page", "executed")
+    return {"id": memory_id, "content": text}
+
+
+@app.put("/api/memories/{memory_id}")
+async def edit_memory(request: Request, memory_id: int, body: MemoryText):
+    context = require_user(request, write=True)
+    text = memory_text(body.content)
+    if not await asyncio.to_thread(context.memories.update, memory_id, text):
+        raise HTTPException(404, "没有这条记忆")
+    context.action_log.record("edit_memory", {"memory_id": memory_id, "content": text}, "page", "executed")
+    return {"id": memory_id, "content": text}
 
 
 @app.get("/api/memories")
@@ -610,6 +729,7 @@ async def list_documents(request: Request):
 @app.post("/api/knowledge")
 async def upload_document(request: Request, file: UploadFile = File()):
     context = require_user(request, write=True)
+    limit("upload", context.user_id)
     # One past the limit is enough to reject it without holding an arbitrarily large upload.
     data = await file.read(MAX_DOCUMENT_BYTES + 1)
     try:
@@ -648,6 +768,7 @@ def probe_audio(path):
 async def upload_meeting(request: Request, file: UploadFile = File(), date: str = Form("")):
     """Save a recording under the user's own folder and start the notes task for it."""
     context = require_user(request, write=True)
+    limit("upload", context.user_id)
     if not API_KEY:
         raise HTTPException(400, "请设置 DEEPSEEK_API_KEY 环境变量后重启后端")
     original = Path(file.filename or "录音").name
@@ -786,6 +907,7 @@ def submit_or_refuse(context, kind, title, payload):
 async def start_audio_script(request: Request, body: AudioScriptRequest):
     """Writer and editor agents draft a script; with render it goes straight on to audio."""
     context = require_user(request, write=True)
+    limit("task", context.user_id)
     topic = body.topic.strip()
     if not 2 <= len(topic) <= 500:
         raise HTTPException(400, "主题要在 2 到 500 字之间")
@@ -799,6 +921,7 @@ async def start_audio_script(request: Request, body: AudioScriptRequest):
 async def start_audio_render(request: Request, body: AudioRenderRequest):
     """Voice a script the user has read and perhaps edited. No model is called, so no key is needed."""
     context = require_user(request, write=True)
+    limit("task", context.user_id)
     text = body.text.strip()
     if not text:
         raise HTTPException(400, "稿子是空的")
@@ -886,6 +1009,7 @@ async def practice_say(request: Request, body: SayRequest):
     (edge-tts, free, sends the text to Microsoft) or the learner's own cloned voice (CosyVoice on this machine).
     The same sentence in the same voice is made once and kept, so replaying it costs nothing."""
     context = require_user(request, write=True)
+    limit("lookup", context.user_id)
     text = " ".join(body.text.split())
     if not 1 <= len(text) <= practice.MAX_SAY_CHARS or not practice.words(text):
         raise HTTPException(400, f"要读的句子需要是 1 到 {practice.MAX_SAY_CHARS} 字的英文")
@@ -946,6 +1070,7 @@ async def ask_agent(context, spec, material, task):
 async def english_translate(request: Request, body: TranslateRequest):
     """A Chinese translation of one sentence, made when first asked for and kept."""
     context = require_user(request, write=True)
+    limit("lookup", context.user_id)
     text = english_text(body.text, practice.MAX_SAY_CHARS)
     cache, key = LookupCache(context.root / "agent.db"), "zh:" + hashlib.sha1(text.encode("utf-8")).hexdigest()
     if (saved := await asyncio.to_thread(cache.get, key)) is not None:
@@ -964,6 +1089,7 @@ async def english_explain(request: Request, body: ExplainRequest):
     Looking something up means it was not understood, so it goes into the vocabulary book (once; looking it
     up again just counts it again)."""
     context = require_user(request, write=True)
+    limit("lookup", context.user_id)
     text = english_text(body.text, practice.MAX_LOOKUP_CHARS)
     around = " ".join(body.context.split())[:500]
     cache = LookupCache(context.root / "agent.db")
@@ -1003,6 +1129,7 @@ async def english_review(request: Request):
 async def english_quiz_start(request: Request):
     """A quiz from what is due: mistakes first, then whatever has waited longest, ten at most."""
     context = require_user(request, write=True)
+    limit("task", context.user_id)
     items = await asyncio.to_thread(context.english.due, quiz.MAX_QUESTIONS)
     if not items:
         due, upcoming = await asyncio.to_thread(context.english.due_count)
@@ -1021,6 +1148,24 @@ async def english_quiz_start(request: Request):
     questions = quiz.build(items, distractors)
     quiz_id = await asyncio.to_thread(context.english.create_quiz, questions)
     return {"id": quiz_id, "questions": quiz.for_page(questions)}
+
+
+@app.get("/api/english/quizzes")
+async def english_quiz_history(request: Request):
+    """Finished quizzes, newest first, with their scores."""
+    context = require_user(request)
+    return {"quizzes": await asyncio.to_thread(context.english.quizzes, 30)}
+
+
+@app.get("/api/english/quizzes/{quiz_id}")
+async def english_quiz_detail(request: Request, quiz_id: int):
+    """One finished quiz: the questions, what was answered, and how each was graded."""
+    context = require_user(request)
+    saved = await asyncio.to_thread(context.english.quiz, quiz_id)
+    if not saved or not saved["finished_at"]:
+        raise HTTPException(404, "没有这次测验")
+    return {"id": saved["id"], "created_at": saved["created_at"], "score": saved["score"], "questions": quiz.for_page(saved["questions"]),
+            "answers": saved["answers"], "results": saved["results"]}
 
 
 class QuizAnswers(BaseModel):
@@ -1046,16 +1191,57 @@ async def english_quiz_submit(request: Request, quiz_id: int, body: QuizAnswers)
     for question in questions:
         answer = answers.get(str(question["id"]))
         ok, comment = verdicts[question["id"]], ""
+        near = ok == quiz.NEAR
+        if near:
+            ok, comment = True, f"拼写差一个字母，正确是 {question['expected']}"
         if ok is None:
             grade = grades.get(question["id"])
             ok, comment = (grade["ok"], grade["comment"]) if grade else (quiz.closeness(question["expected"], answer) >= quiz.OPEN_PASS, "")
-        review = await asyncio.to_thread(context.english.record_review, question["item_id"], ok)
+        review = await asyncio.to_thread(context.english.record_review, question["item_id"], None if near else ok)
         expected = question["options"][question["expected"]] if question["type"] == "choice" else question["expected"]
-        results.append({"id": question["id"], "ok": ok, "expected": expected, "comment": comment, "review": review})
+        results.append({"id": question["id"], "ok": ok, "near": near, "expected": expected, "comment": comment, "review": review})
     score = sum(result["ok"] for result in results)
     if not await asyncio.to_thread(context.english.finish_quiz, quiz_id, answers, results, score):
         raise HTTPException(409, "这次测验已经交过了")
     return {"score": score, "total": len(results), "results": results}
+
+
+class ChatTitle(BaseModel):
+    title: str
+
+
+@app.get("/api/chats")
+async def list_chats(request: Request, q: str = ""):
+    """The assistant conversations, newest first; q finds those whose title or messages contain it."""
+    context = require_user(request)
+    return {"chats": await asyncio.to_thread(context.chats.list, q[:100])}
+
+
+@app.get("/api/chats/{chat_id}")
+async def get_chat(request: Request, chat_id: int):
+    context = require_user(request)
+    chat = await asyncio.to_thread(context.chats.get, chat_id)
+    if not chat:
+        raise HTTPException(404, "没有这次对话")
+    return chat
+
+
+@app.post("/api/chats/{chat_id}/title")
+async def rename_chat(request: Request, chat_id: int, body: ChatTitle):
+    context = require_user(request, write=True)
+    if not body.title.strip():
+        raise HTTPException(400, "标题不能为空")
+    if not await asyncio.to_thread(context.chats.rename, chat_id, body.title):
+        raise HTTPException(404, "没有这次对话")
+    return {"ok": True}
+
+
+@app.delete("/api/chats/{chat_id}")
+async def delete_chat(request: Request, chat_id: int):
+    context = require_user(request, write=True)
+    if not await asyncio.to_thread(context.chats.delete, chat_id):
+        raise HTTPException(404, "没有这次对话")
+    return {"ok": True}
 
 
 @app.get("/api/english/items")
@@ -1085,7 +1271,8 @@ async def english_item_delete(request: Request, item_id: int):
 @app.post("/api/practice/read")
 async def practice_read(request: Request, audio: UploadFile = File(), target: str = Form()):
     """Read-aloud check: what the recognizer heard, word by word against the sentence. Runs locally, costs nothing."""
-    require_user(request, write=True)
+    context = require_user(request, write=True)
+    limit("lookup", context.user_id)
     target = target.strip()
     if not 1 <= len(target) <= 200 or not practice.words(target):
         raise HTTPException(400, "跟读句子要是 1 到 200 字的英文")
@@ -1103,6 +1290,7 @@ async def practice_read(request: Request, audio: UploadFile = File(), target: st
 async def practice_report_again(request: Request, session_id: int):
     """Ask again for a report, for a session whose report could not start when it ended."""
     context = require_user(request, write=True)
+    limit("task", context.user_id)
     session = await asyncio.to_thread(context.english.session, session_id)
     if not session or not session["ended_at"] or not session["transcript"]:
         raise HTTPException(404, "没有可总结的对话")
@@ -1124,6 +1312,7 @@ async def list_tasks(request: Request):
 @app.post("/api/tasks")
 async def submit_task(request: Request, body: TaskRequest):
     context = require_user(request, write=True)
+    limit("task", context.user_id)
     if len(json.dumps(body.input, ensure_ascii=False)) > agents.MAX_INPUT_CHARS:
         raise HTTPException(413, "内容太长")
     if not API_KEY:
@@ -1156,6 +1345,47 @@ async def cancel_task(request: Request, task_id: int):
 async def task_seen(request: Request, task_id: int):
     context = require_user(request, write=True)
     return {"ok": await asyncio.to_thread(context.tasks.mark_seen, task_id)}
+
+
+class ReminderForm(BaseModel):
+    content: str
+    due_at: str
+    repeat: str = ""
+
+
+def reminder_fields(body):
+    """The same checks the voice tool makes: some words, a real time in the future, a known way of repeating."""
+    text = " ".join(body.content.split())
+    if not 1 <= len(text) <= agent_tools.MAX_MEMORY_CHARS:
+        raise HTTPException(400, f"提醒内容要在 1 到 {agent_tools.MAX_MEMORY_CHARS} 字之间")
+    try:
+        due = agent_tools.parse_due(body.due_at)
+    except agent_tools.ToolError as error:
+        raise HTTPException(400, "时间格式不对") from error
+    if due <= datetime.now():
+        raise HTTPException(400, "这个时间已经过去了")
+    if body.repeat not in REPEATS:
+        raise HTTPException(400, "重复方式只能是每天、工作日或每周")
+    return text, due, body.repeat
+
+
+@app.post("/api/reminders")
+async def add_reminder(request: Request, body: ReminderForm):
+    context = require_user(request, write=True)
+    text, due, repeat = reminder_fields(body)
+    reminder_id = await asyncio.to_thread(context.reminders.add, text, due, repeat)
+    context.action_log.record("set_reminder", {"content": text, "due_at": body.due_at, "repeat": repeat}, "page", "executed")
+    return {"id": reminder_id}
+
+
+@app.put("/api/reminders/{reminder_id}")
+async def edit_reminder(request: Request, reminder_id: int, body: ReminderForm):
+    context = require_user(request, write=True)
+    text, due, repeat = reminder_fields(body)
+    if not await asyncio.to_thread(context.reminders.update, reminder_id, text, due, repeat):
+        raise HTTPException(404, "没有这条待办提醒")
+    context.action_log.record("edit_reminder", {"reminder_id": reminder_id, "content": text, "due_at": body.due_at, "repeat": repeat}, "page", "executed")
+    return {"id": reminder_id}
 
 
 @app.get("/api/reminders")
@@ -1203,6 +1433,7 @@ async def voices(request: Request):
 @app.post("/api/voices")
 async def upload_voice(request: Request, name: str = Form(), prompt_text: str = Form(), audio: UploadFile = File()):
     context = require_user(request, write=True)
+    limit("upload", context.user_id)
     data = await audio.read(10 * 1024 * 1024 + 1)
     await audio.close()
     if len(data) > 10 * 1024 * 1024:
@@ -1276,6 +1507,7 @@ async def mic_test(request: Request):
 @app.post("/api/voice/preview")
 async def preview_voice(request: Request):
     context = require_user(request, write=True)
+    limit("lookup", context.user_id)
     task = asyncio.create_task(synthesize("你好，今天过得怎么样？"))
     try:
         while not task.done():
@@ -1315,6 +1547,7 @@ async def websocket(ws: WebSocket):
     decoder = None
     downlink_ogg = False
     history = Conversation()
+    chat_id = None  # the saved conversation this socket is adding to; one is created on the first answer
     finished_actions = []
     claimed = {}
     task = None
@@ -1568,6 +1801,18 @@ async def websocket(ws: WebSocket):
         with contextlib.suppress(Exception):
             await send("practice_stopped", None, session_id=session["id"], task_id=task_id, error=error, notes=len(session["notes"]))
 
+    async def save_chat_turn(rid, said, answered):
+        """Keep a finished turn of the assistant conversation, so it can be read and continued later."""
+        nonlocal chat_id
+        try:
+            if chat_id is None or not await asyncio.to_thread(context.chats.add_turn, chat_id, said, answered):
+                chat_id = await asyncio.to_thread(context.chats.create, said)
+                await asyncio.to_thread(context.chats.add_turn, chat_id, said, answered)
+            saved = await asyncio.to_thread(context.chats.get, chat_id)
+            await send("chat_saved", rid, chat_id=chat_id, title=saved["title"], turns=saved["turns"])
+        except Exception:
+            latency_log.exception("could not save the conversation")
+
     async def reply(rid, text=None, audio=None, source="text"):
         nonlocal spoken_audio
         worker = None
@@ -1590,7 +1835,7 @@ async def websocket(ws: WebSocket):
 
         try:
             if audio is not None:
-                await send("status", rid, text="正在识别…")
+                await send("status", rid, text=f"识别排队中，前面还有 {recognition_gate.queue_length() + 1} 句…" if recognition_gate.busy() else "正在识别…")
                 text = await (asyncio.to_thread(transcribe, audio, "en") if session else asyncio.to_thread(transcribe, audio))
                 spoken_pcm = audio
                 mark("asr_done")
@@ -1769,6 +2014,9 @@ async def websocket(ws: WebSocket):
             else:
                 history.add_turn([user_message, *without_outside_results(added, default_registry)])
                 finished_actions.clear()
+                answered = (added[-1].get("content") or "").strip()
+                if answered and not demo:
+                    await save_chat_turn(rid, text, answered)
             await send("done", rid, tts_failed=tts_failed)
             record_latency(timings, len(added[-1].get("content") or ""), voice.provider)
         except asyncio.CancelledError:
@@ -1821,6 +2069,25 @@ async def websocket(ws: WebSocket):
                 detector = None
                 decoder = None
                 paused = interrupted = False
+                continue
+            if kind == "chat_new":
+                await stop()
+                history.turns.clear()
+                chat_id = None
+                await send("chat_started", None, chat_id=None)
+                continue
+            if kind == "chat_open":
+                opened = await asyncio.to_thread(context.chats.get, data.get("chat_id")) if isinstance(data.get("chat_id"), int) else None
+                if opened is None:
+                    await send("error", None, text="没有这次对话")
+                    continue
+                await stop()
+                history.turns.clear()
+                messages = opened["messages"]
+                for said, answered in zip(messages[::2], messages[1::2]):
+                    history.add_turn([{"role": "user", "content": said["text"]}, {"role": "assistant", "content": answered["text"]}])
+                chat_id = opened["id"]
+                await send("chat_started", None, chat_id=chat_id, title=opened["title"], messages=messages)
                 continue
             if kind == "practice_stop":
                 if practice_session is not None:
@@ -1894,6 +2161,14 @@ async def websocket(ws: WebSocket):
                 practice_session["notes"] = [note for note in practice_session["notes"] if note.get("turn", turn) < turn]
                 await asyncio.to_thread(save_progress, practice_session)
                 await send("practice_rewound", rid, turn=turn, text=redo)
+            elif ((kind in {"text", "practice_start", "practice_resume"} or (kind == "audio_end" and recording and rid == request_id))
+                  and (turn_wait := limiter.hit("turn", context.user_id)) is not None):
+                # Too many questions too fast: say how long to wait; a recording in progress is dropped.
+                metrics.count("limited_turn")
+                await send("error", rid, text=limiter.message("turn", turn_wait))
+                if kind == "audio_end":
+                    recording = False
+                    pcm.clear()
             elif kind in {"interrupt", "text", "audio_start"}:
                 await stop()
                 request_id = rid

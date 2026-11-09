@@ -12,6 +12,7 @@ import httpx
 
 from api_config import auth_error, normalize_key
 from embedding import Embedder
+from memory_store import REPEATS
 import usage
 import user_context
 
@@ -306,14 +307,17 @@ def parse_due(text):
     return due.astimezone().replace(tzinfo=None) if due.tzinfo else due
 
 
-async def set_reminder(content, due_at):
+async def set_reminder(content, due_at, repeat=""):
     text, due = content.strip(), parse_due(due_at)
     if not 1 <= len(text) <= MAX_MEMORY_CHARS:
         raise ToolError(f"提醒内容要在 1 到 {MAX_MEMORY_CHARS} 字之间")
     if due <= datetime.now():
         raise ToolError(f"提醒时间 {due_at} 已经过去了，请和用户确认时间")
-    reminder_id = reminders().add(text, due)
-    return {"saved": True, "say": f"提醒设好了，{spoken_time(due)}：{text}", "undo": {"kind": "reminder", "action": "delete", "id": reminder_id}}
+    if repeat not in REPEATS:
+        raise ToolError("repeat 只能是 daily、weekdays、weekly 或不填")
+    reminder_id = reminders().add(text, due, repeat)
+    every = f"（{REPEATS[repeat]}重复）" if repeat else ""
+    return {"saved": True, "say": f"提醒设好了，{spoken_time(due)}：{text}{every}", "undo": {"kind": "reminder", "action": "delete", "id": reminder_id}}
 
 
 async def cancel_reminder(reminder_id):
@@ -336,7 +340,8 @@ CLEAR_MEMORIES = Tool("clear_memories", "清空全部长期记忆，无法恢复
 SET_REMINDER = Tool("set_reminder", "新建一个到时间主动播报的提醒", {
     "type": "object", "required": ["content", "due_at"], "properties": {
         "content": {"type": "string", "description": "提醒的事项，不含时间，如开会"},
-        "due_at": {"type": "string", "description": "本地时间，格式 YYYY-MM-DDTHH:MM:SS，根据系统提示的当前时间计算"}}},
+        "due_at": {"type": "string", "description": "本地时间，格式 YYYY-MM-DDTHH:MM:SS，根据系统提示的当前时间计算；重复提醒填第一次的时间"},
+        "repeat": {"type": "string", "enum": ["daily", "weekdays", "weekly"], "description": "用户说每天、每个工作日、每周时才填，否则不填"}}},
     set_reminder, "正在设置提醒…", filler=False, level="reversible", action="设置提醒")
 CANCEL_REMINDER = Tool("cancel_reminder", "取消一个待办提醒。用系统提示里待办提醒前面的编号", {
     "type": "object", "required": ["reminder_id"], "properties": {"reminder_id": {"type": "string", "description": "提醒编号，如 2"}}},

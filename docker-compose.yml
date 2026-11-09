@@ -1,0 +1,29 @@
+# Small trial deployment: the app behind nginx, which terminates HTTPS (browsers allow the microphone and
+# WebCodecs Opus only over HTTPS). Secrets come from .env, which is never committed (copy .env.example).
+services:
+  app:
+    build: .
+    image: local-voice-chat:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      FORWARDED_ALLOW_IPS: "*"   # only nginx can reach the app: it publishes no port of its own
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models:ro
+      - ./backups:/app/backups
+    expose:
+      - "8765"
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/certs:/etc/nginx/certs:ro
